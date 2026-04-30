@@ -1713,65 +1713,187 @@ def api_insights():
     except: return jsonify([])
 
 @app.route("/api/run_ai", methods=["POST"])
+@app.route("/api/run_ai", methods=["POST"])
 def api_run_ai():
+    """Run Claude AI analysis safely without crashing on empty data or API errors."""
     if not ANTHROPIC_API_KEY:
-        return jsonify({"error":"No API key"}),400
+        msg = "חסר ANTHROPIC_API_KEY ב-Railway. הוסף את המפתח של Anthropic ב-Variables."
+        try:
+            conn = get_db()
+            try:
+                conn.run("""INSERT INTO ai_insights (insight_type,content,goals_analyzed)
+                    VALUES ('market_analysis',:a,0)""", a=msg)
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        return jsonify({"error": "Missing ANTHROPIC_API_KEY", "message": msg}), 400
+
     try:
         conn = get_db()
         try:
-            goals=conn.run("""SELECT g.minute,g.score_before,g.odds_30s,g.odds_60s,m.league,
-                m.home_team,m.away_team
+            goals = conn.run("""SELECT g.minute,g.score_before,g.score_after,g.odds_30s,g.odds_60s,
+                g.recorded_at,m.league,m.home_team,m.away_team
                 FROM goals g LEFT JOIN matches m ON g.match_id=m.match_id
-                ORDER BY g.recorded_at DESC LIMIT 200""")
-            sigs=conn.run("""SELECT rule_num,rule_name,COUNT(*) as cnt,
-                AVG(confidence) as avg_conf,AVG(pressure_score) as avg_pres
-                FROM signals GROUP BY rule_num,rule_name ORDER BY cnt DESC""")
-            snaps=conn.run("SELECT COUNT(*) FROM odds_snapshots")[0][0]
-            ht_snaps=conn.run("SELECT COUNT(*) FROM odds_snapshots WHERE market IN ('over05ht','over15ht')")[0][0]
+                ORDER BY g.recorded_at DESC LIMIT 100""")
 
-            goals_txt=f"סה\"כ {len(goals)} גולים\n"
+            signals = conn.run("""SELECT rule_num,rule_name,signal_type,confidence,pressure_score,minute,
+                over_odd,draw_odd,reason,detected_at
+                FROM signals
+                ORDER BY detected_at DESC LIMIT 150""")
+
+            total_snapshots = conn.run("SELECT COUNT(*) FROM odds_snapshots")[0][0]
+            total_signals = conn.run("SELECT COUNT(*) FROM signals")[0][0]
+            total_goals = conn.run("SELECT COUNT(*) FROM goals")[0][0]
+            ht_snapshots = conn.run("SELECT COUNT(*) FROM odds_snapshots WHERE market IN ('over05ht','over15ht')")[0][0]
+
+            validation_summary = "Validation data not available yet."
+            pattern_summary = "PatternStats table not available yet."
+
+            try:
+                v = conn.run("""SELECT
+                    COUNT(*) FILTER (WHERE validated=TRUE) AS validated,
+                    COUNT(*) FILTER (WHERE checked_2m=TRUE) AS checked_2m,
+                    COUNT(*) FILTER (WHERE checked_5m=TRUE) AS checked_5m,
+                    COUNT(*) FILTER (WHERE checked_10m=TRUE) AS checked_10m,
+                    COUNT(*) FILTER (WHERE false_positive=TRUE) AS false_positive
+                    FROM signals""")[0]
+                validation_summary = (
+                    f"validated={v[0] or 0}, checked_2m={v[1] or 0}, "
+                    f"checked_5m={v[2] or 0}, checked_10m={v[3] or 0}, "
+                    f"false_positive={v[4] or 0}"
+                )
+            except Exception as e:
+                log.warning(f"AI validation summary unavailable: {e}")
+
+            try:
+                p = conn.run("""SELECT pattern_id,total_cases,success_rate_5m,success_rate_10m,confidence_level
+                    FROM pattern_stats ORDER BY total_cases DESC LIMIT 20""")
+                if p:
+                    pattern_summary = "\n".join([
+                        f"{row[0]} | cases={row[1]} | 5m={round((row[2] or 0)*100,1)}% | 10m={round((row[3] or 0)*100,1)}% | confidence={row[4]}"
+                        for row in p
+                    ])
+                else:
+                    pattern_summary = "No pattern_stats rows yet."
+            except Exception as e:
+                log.warning(f"AI pattern summary unavailable: {e}")
+
+            if total_goals == 0 and total_signals == 0:
+                content = (
+                    "עדיין אין מספיק נתונים לניתוח AI.\n\n"
+                    "המערכת נמצאת במצב Learning Mode. כרגע צריך להמשיך לאסוף:\n"
+                    "1. משחקים חיים עם odds\n"
+                    "2. snapshots לפני ואחרי שינויי יחס\n"
+                    "3. goals מזוהים אוטומטית\n"
+                    "4. signals שעוברים validation אחרי 2/5/10 דקות\n\n"
+                    "ברגע שיצטברו signals וגולים, Claude יוכל להתחיל לזהות דפוסים אמיתיים."
+                )
+                conn.run("""INSERT INTO ai_insights (insight_type,content,goals_analyzed)
+                    VALUES ('market_analysis',:a,0)""", a=content)
+                return jsonify({"status":"ok","message":"Not enough data yet","analysis":content})
+
+            goals_lines = []
             for g in goals[:30]:
-                o30=g[2]or{}
-                over30=next((v for k,v in o30.items() if 'over' in str(k).lower()),None)
-                goals_txt+=f"דקה {g[0]} | {g[1]} | Over 30s לפני: {over30 or '?'} | {g[4]}\n"
+                o30 = g[3] or {}
+                over30 = None
+                try:
+                    over30 = next((v for k, v in o30.items() if 'over' in str(k).lower()), None)
+                except Exception:
+                    over30 = None
+                goals_lines.append(
+                    f"minute={g[0]} | score_before={g[1]} | score_after={g[2]} | over_30s_before={over30 or '?'} | league={g[6] or ''} | match={g[7] or ''} vs {g[8] or ''}"
+                )
 
-            rules_txt="ביצועי חוקים:\n"+"\n".join([
-                f"R{s[0]} {s[1]}: {s[2]}x | conf:{round(s[3]or 0)}% | pressure:{round(s[4]or 0)}%"
-                for s in sigs])
+            signal_lines = []
+            for s in signals[:40]:
+                signal_lines.append(
+                    f"R{s[0]} {s[1]} | type={s[2]} | conf={s[3]} | pressure={s[4]} | minute={s[5]} | over={s[6]} | draw={s[7]} | reason={s[8]}"
+                )
 
-            prompt=f"""אתה PapaGoal AI – מנתח שוק הימורים מקצועי.
+            prompt = f"""אתה PapaGoal AI — מנתח שוק הימורים ולמידת דפוסים.
 
-נתונים:
-- {snaps} דגימות כלליות
-- {ht_snaps} דגימות HT (Over 0.5/1.5 מחצית)
-- {len(goals)} גולים מוקלטים
+חשוב:
+- המערכת במצב Learning Mode.
+- אל תיתן הוראות הימור ישירות.
+- אל תגיד ENTER / BET / EXIT.
+- תן ניתוח הסתברותי, מה חסר, ומה כדאי למערכת להמשיך ללמוד.
 
-{goals_txt}
+מצב הדאטה:
+- snapshots: {total_snapshots}
+- HT snapshots: {ht_snapshots}
+- total signals: {total_signals}
+- total goals: {total_goals}
+- validation summary: {validation_summary}
 
-{rules_txt}
+PatternStats:
+{pattern_summary}
 
-ענה בעברית בפירוט:
-1. אילו יחסים הופיעו לפני גולים? (ממוצעים)
-2. מה לחץ השוק הממוצע לפני גול?
-3. אילו חוקים עובדים הכי טוב?
-4. דפוסים חדשים שגילית?
-5. מה נקודת ה-80% – באיזה יחס כדאי להיכנס?
-6. חוק חדש שאתה ממליץ להוסיף?"""
+גולים אחרונים:
+{chr(10).join(goals_lines) if goals_lines else 'No goals yet'}
 
-            resp=requests.post("https://api.anthropic.com/v1/messages",
-                headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-                json={"model":"claude-sonnet-4-20250514","max_tokens":1500,
-                      "messages":[{"role":"user","content":prompt}]},timeout=30)
-            if resp.status_code==200:
-                analysis=resp.json()["content"][0]["text"]
-                conn.run("INSERT INTO ai_insights (insight_type,content,goals_analyzed) VALUES ('market_analysis',:a,:b)",
-                    a=analysis,b=len(goals))
-                return jsonify({"status":"ok","analysis":analysis})
-            else:
-                return jsonify({"error":f"Claude API: {resp.status_code}"}),500
-        finally: conn.close()
+Signals אחרונים:
+{chr(10).join(signal_lines) if signal_lines else 'No signals yet'}
+
+ענה בעברית בצורה מסודרת:
+1. מה ניתן ללמוד כרגע מהנתונים?
+2. האם יש מספיק דאטה או שהמערכת עדיין מוקדמת מדי?
+3. אילו דפוסים ראשוניים אפשר לחשוד בהם, אם בכלל?
+4. איפה קיימים סיכוני false positive?
+5. מה חסר כדי להגיע לתובנות אמינות?
+6. אילו 3 דברים הכי חשוב להמשיך לאסוף עכשיו?
+"""
+
+            model = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "max_tokens": 1400,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=45,
+            )
+
+            if resp.status_code != 200:
+                error_text = resp.text[:1000]
+                log.error(f"Claude API error status={resp.status_code}: {error_text}")
+                content = (
+                    "Claude AI לא הצליח להריץ ניתוח כרגע.\n\n"
+                    f"Status: {resp.status_code}\n"
+                    f"Details: {error_text}\n\n"
+                    "המערכת ממשיכה לאסוף נתונים כרגיל."
+                )
+                try:
+                    conn.run("""INSERT INTO ai_insights (insight_type,content,goals_analyzed)
+                        VALUES ('market_analysis',:a,:b)""", a=content, b=total_goals)
+                except Exception:
+                    pass
+                return jsonify({
+                    "error": "Claude API failed",
+                    "status_code": resp.status_code,
+                    "details": error_text,
+                }), 500
+
+            data = resp.json()
+            analysis = data.get("content", [{}])[0].get("text", "No text returned from Claude")
+
+            conn.run("""INSERT INTO ai_insights (insight_type,content,goals_analyzed)
+                VALUES ('market_analysis',:a,:b)""", a=analysis, b=total_goals)
+
+            return jsonify({"status":"ok","analysis":analysis,"goals_analyzed":total_goals})
+
+        finally:
+            conn.close()
+
     except Exception as e:
-        return jsonify({"error":str(e)}),500
+        log.exception("run_ai failed")
+        return jsonify({"error":"run_ai crashed","details":str(e)}), 500
 
 
 @app.route("/api/debug_linking")
