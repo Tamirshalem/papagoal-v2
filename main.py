@@ -16,6 +16,9 @@ DATABASE_URL      = os.environ.get("DATABASE_URL", "")
 BETFAIR_APP_KEY   = os.environ.get("BETFAIR_APP_KEY", "")
 BETFAIR_USERNAME  = os.environ.get("BETFAIR_USERNAME", "")
 BETFAIR_PASSWORD  = os.environ.get("BETFAIR_PASSWORD", "")
+# Betfair is disabled by default to keep the collector fast and clean.
+# To enable it later, set USE_BETFAIR=true in Railway environment variables.
+USE_BETFAIR       = os.environ.get("USE_BETFAIR", "false").lower() == "true"
 PORT              = int(os.environ.get("PORT", 8080))
 POLL_INTERVAL     = 30
 
@@ -931,14 +934,14 @@ Over 2.5: {over_odd} | Draw: {draw_odd}
 def collector_loop():
     time.sleep(5)
     fetch_live_football()
-    if BETFAIR_APP_KEY:
+    if USE_BETFAIR and BETFAIR_APP_KEY:
         betfair_login()
         fetch_betfair_ht()
     while True:
         collect()
         validate_signals()
         fetch_live_football()
-        if BETFAIR_APP_KEY:
+        if USE_BETFAIR and BETFAIR_APP_KEY:
             fetch_betfair_ht()
         time.sleep(POLL_INTERVAL)
 
@@ -1778,7 +1781,7 @@ def health():
 init_db()
 _t = threading.Thread(target=collector_loop, daemon=True)
 _t.start()
-log.info("🚀 PapaGoal v2 + Betfair started")
+log.info(f"🚀 PapaGoal v2 started | Betfair enabled={USE_BETFAIR}")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)
