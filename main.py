@@ -356,11 +356,17 @@ def fetch_odds_api():
         r=requests.get(f"{ODDSAPI_BASE}/events",
             params={"apiKey":ODDSAPI_KEY,"sport":"football","status":"live","limit":50},timeout=15)
         if r.status_code!=200: log.warning(f"OddsAPI events: {r.status_code}"); return []
-        data=r.json()
-        events=data.get("data",data if isinstance(data,list) else [])
+        raw=r.json()
+        # Handle both list and dict responses
+        if isinstance(raw, list):
+            events = raw
+        elif isinstance(raw, dict):
+            events = raw.get("data") or raw.get("events") or raw.get("results") or []
+        else:
+            events = []
         if not events: return []
         log.info(f"📡 OddsAPI: {len(events)} live events")
-        result=[]; ids=[str(e.get("id") or e.get("eventId","")) for e in events if e.get("id") or e.get("eventId")]
+        result=[]; ids=[str(e.get("id") or e.get("eventId") or e.get("event_id","")) for e in events if e.get("id") or e.get("eventId") or e.get("event_id")]
         for i in range(0,len(ids),10):
             batch=ids[i:i+10]
             try:
@@ -368,7 +374,9 @@ def fetch_odds_api():
                     params={"apiKey":ODDSAPI_KEY,"eventId":",".join(batch),"bookmakers":"Bet365",
                            "markets":"1x2,over_under_25,over_under_05_ht,over_under_15_ht"},timeout=15)
                 if r2.status_code==200:
-                    d2=r2.json(); result.extend(d2.get("data",d2 if isinstance(d2,list) else []))
+                    d2=r2.json()
+                    if isinstance(d2, list): result.extend(d2)
+                    elif isinstance(d2, dict): result.extend(d2.get("data") or d2.get("results") or [])
             except Exception as e: log.error(f"OddsAPI batch: {e}")
         return result
     except Exception as e: log.error(f"OddsAPI: {e}"); return []
