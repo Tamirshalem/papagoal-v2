@@ -190,6 +190,29 @@ def init_db():
             UNIQUE(rule_name)
         )""")
         conn.run("CREATE INDEX IF NOT EXISTS idx_ai_rule_candidates_status ON ai_rule_candidates(status, active)")
+        conn.run("""CREATE TABLE IF NOT EXISTS simulated_bets (
+            id SERIAL PRIMARY KEY,
+            signal_id INT UNIQUE,
+            match_id TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            resolved_at TIMESTAMPTZ,
+            home_team TEXT, away_team TEXT, league TEXT,
+            minute INT DEFAULT 0, score TEXT DEFAULT '0-0',
+            action_type TEXT,
+            market TEXT DEFAULT 'Over/No Goal',
+            entry_odd FLOAT,
+            virtual_stake FLOAT DEFAULT 100,
+            virtual_profit FLOAT DEFAULT 0,
+            confidence INT DEFAULT 0,
+            reason TEXT,
+            status TEXT DEFAULT 'open',
+            result TEXT,
+            goal_within_10m BOOLEAN,
+            validated BOOLEAN DEFAULT FALSE
+        )""")
+        conn.run("CREATE INDEX IF NOT EXISTS idx_simulated_bets_status ON simulated_bets(status, validated)")
+        conn.run("CREATE INDEX IF NOT EXISTS idx_simulated_bets_match ON simulated_bets(match_id, created_at)")
+
         # --- Validation columns for learning engine ---
         conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS checked_2m BOOLEAN DEFAULT FALSE")
         conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS checked_5m BOOLEAN DEFAULT FALSE")
@@ -759,14 +782,19 @@ def set_opening(match_id, market, odd):
         return True
     return False
 
-def get_odds_before(conn, match_id, seconds):
+def get_odds_before(conn, match_id, goal_time, seconds):
+    """Get odds snapshots before the actual goal time, not before NOW()."""
     try:
         rows = conn.run("""SELECT market, outcome, odd_value FROM odds_snapshots
             WHERE match_id=:a
-            AND captured_at BETWEEN NOW()-INTERVAL '1 second'*:c AND NOW()-INTERVAL '1 second'*:b
+            AND captured_at BETWEEN (:gt - INTERVAL '1 second'*:c)
+                                AND (:gt - INTERVAL '1 second'*:b)
             ORDER BY captured_at DESC LIMIT 20""",
-            a=match_id, b=max(0, seconds-10), c=seconds+25)
+            a=match_id, gt=goal_time, b=max(0, seconds-10), c=seconds+25)
         return {f"{r[0]}_{r[1]}": r[2] for r in rows} if rows else {}
+    except Exception as e:
+        log.error(f"get_odds_before error match={match_id} seconds={seconds}: {e}")
+        return {}
 # ─── OddsAPI.io Collector ─────────────────────────────────────────────────────
 # Pull ALL live football events from OddsAPI.io, then fetch Bet365 odds for every
 # event in batches of 10 every POLL_INTERVAL seconds.
@@ -1051,7 +1079,7 @@ def collect():
                 prev_total=last_scores.get(mid); curr_total=hg+ag
                 if prev_total is not None and curr_total > prev_total and is_live:
                     log.info(f"⚽ GOAL: {home} vs {away} {score} min:{min_}")
-                    o10=get_odds_before(conn,mid,10); o30=get_odds_before(conn,mid,30); o60=get_odds_before(conn,mid,60); o120=get_odds_before(conn,mid,120); o300=get_odds_before(conn,mid,300)
+                    goal_time=datetime.now(timezone.utc); o10=get_odds_before(conn,mid,goal_time,10); o30=get_odds_before(conn,mid,goal_time,30); o60=get_odds_before(conn,mid,goal_time,60); o120=get_odds_before(conn,mid,goal_time,120); o300=get_odds_before(conn,mid,goal_time,300)
                     conn.run("""INSERT INTO goals (match_id,minute,score_before,score_after,auto_detected,odds_10s,odds_30s,odds_60s,odds_120s,odds_300s) VALUES (:a,:b,:c,:d,TRUE,:e,:f,:g,:h,:i)""", a=mid,b=min_,c=str(prev_total),d=score,e=json.dumps(o10),f=json.dumps(o30),g=json.dumps(o60),h=json.dumps(o120),i=json.dumps(o300))
                     log.info(f"Goal odds captured: 10s={len(o10)} 30s={len(o30)} 60s={len(o60)} 120s={len(o120)} 300s={len(o300)}")
                     for t,col in [(30,"goal_30s"),(60,"goal_60s"),(120,"goal_120s"),(300,"goal_300s")]:
@@ -1063,8 +1091,26 @@ def collect():
                     if prev_over: chg_over=round(over_odd-prev_over,3); dir_over="down" if chg_over<0 else ("up" if chg_over>0 else "stable")
                     pres=pressure_score(over_odd, get_opening(mid,"over25"), min_)
                     sigs=run_rules(mid,home,away,league,over_odd,draw_odd,hw_odd,aw_odd,over05ht,over15ht,opening_o05,opening_o15,min_,held_over,dir_over,chg_over,pres)
-                    for s in sigs:
-                        conn.run("""INSERT INTO signals (match_id,home_team,away_team,league,rule_num,rule_name,minute,score,signal_type,verdict,confidence,reason,over_odd,draw_odd,over05ht_odd,over15ht_odd,opening_over05ht,opening_over15ht,pressure_score,held_seconds,direction,odd_change) VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,:l,:m,:n,:o,:p,:q,:r,:s,:t,:u,:v)""", a=mid,b=home,c=away,d=league,e=s["rule_num"],f=s["rule_name"],g=min_,h=score,i=s["signal_type"],j=s["verdict"],k=s["confidence"],l=s["reason"],m=over_odd,n=draw_odd,o=over05ht,p=over15ht,q=opening_o05,r=opening_o15,s=pres,t=held_over,u=dir_over,v=chg_over)
+                    for sig in sigs:
+                        inserted = conn.run("""INSERT INTO signals
+                            (match_id,home_team,away_team,league,rule_num,rule_name,
+                             minute,score,signal_type,verdict,confidence,reason,
+                             over_odd,draw_odd,over05ht_odd,over15ht_odd,
+                             opening_over05ht,opening_over15ht,pressure_score,
+                             held_seconds,direction,odd_change)
+                            VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,:l,
+                                    :m,:n,:o,:p,:q,:r,:ps,:t,:u,:v)
+                            RETURNING id""",
+                            a=mid,b=home,c=away,d=league,e=sig["rule_num"],f=sig["rule_name"],
+                            g=min_,h=score,i=sig["signal_type"],j=sig["verdict"],
+                            k=sig["confidence"],l=sig["reason"],m=over_odd,n=draw_odd,
+                            o=over05ht,p=over15ht,q=opening_o05,r=opening_o15,
+                            ps=pres,t=held_over,u=dir_over,v=chg_over)
+                        try:
+                            sig_id = inserted[0][0] if inserted else None
+                            create_simulated_bet(conn, sig_id, mid, home, away, league, min_, score, sig, over_odd)
+                        except Exception as e:
+                            log.warning(f"simulated bet create failed: {e}")
             global last_pipeline_stats
             last_pipeline_stats={"live_fixtures":len(live_data),"odds_games":len(games),"linked_live":live_cnt,"untracked_live":max(0,len(live_data)-live_cnt),"last_odds_update":datetime.now(timezone.utc).isoformat(),"linked_examples":linked_examples,"unlinked_examples":unlinked_examples,"provider":"OddsAPI.io","bookmaker":ODDSPAPI_BOOKMAKER}
             log.info(f"✅ OddsAPI.io Saved | linked:{live_cnt}/{len(games)} | fixtures:{len(live_data)} | untracked:{max(0,len(live_data)-live_cnt)} | bookmaker:{ODDSPAPI_BOOKMAKER}")
@@ -1081,6 +1127,7 @@ def collector_loop():
     while True:
         collect()
         validate_signals()
+        validate_simulated_bets()
         fetch_live_football()
         if USE_BETFAIR and BETFAIR_APP_KEY:
             fetch_betfair_ht()
@@ -1159,6 +1206,85 @@ def failure_reason_for_signal(signal_type, direction, held_seconds, pressure, ov
     if signal_type == "trap":
         reasons.append("trap-style signal")
     return "; ".join(reasons) if reasons else "goal did not occur within validation window"
+
+def create_simulated_bet(conn, signal_id, match_id, home, away, league, minute, score, sig, over_odd):
+    """Create a paper-trade style simulated action from a signal.
+    This is NOT a real bet. It is used only to measure model accuracy.
+    """
+    if not signal_id:
+        return
+    try:
+        conf = int(sig.get("confidence") or 0)
+        stype = sig.get("signal_type") or ""
+        if conf < 70:
+            return
+        if stype == "goal":
+            action_type = "GOAL_WITHIN_10M"
+            market = "Goal / Over"
+            entry_odd = float(over_odd or 0)
+        elif stype in ("no_goal", "trap"):
+            action_type = "NO_GOAL_10M"
+            market = "No Goal / Avoid Goal"
+            entry_odd = None
+        else:
+            return
+        conn.run("""INSERT INTO simulated_bets
+            (signal_id, match_id, home_team, away_team, league, minute, score,
+             action_type, market, entry_odd, virtual_stake, confidence, reason)
+            VALUES (:sid,:mid,:h,:a,:lg,:m,:sc,:act,:market,:odd,100,:conf,:reason)
+            ON CONFLICT (signal_id) DO NOTHING""",
+            sid=signal_id, mid=match_id, h=home, a=away, lg=league, m=minute,
+            sc=score, act=action_type, market=market, odd=entry_odd,
+            conf=conf, reason=sig.get("reason") or sig.get("verdict") or "")
+    except Exception as e:
+        log.error(f"create_simulated_bet error: {e}")
+
+def validate_simulated_bets():
+    """Resolve simulated actions after 10 minutes.
+    Goal actions win if a goal happened within 10m.
+    No-goal/trap actions win if no goal happened within 10m.
+    """
+    try:
+        conn = get_db()
+    except Exception as e:
+        log.error(f"validate_simulated_bets DB connect error: {e}")
+        return
+    try:
+        rows = conn.run("""SELECT id, match_id, created_at, action_type, entry_odd, virtual_stake
+            FROM simulated_bets
+            WHERE COALESCE(validated,FALSE)=FALSE
+            AND created_at < NOW() - INTERVAL '10 minutes'
+            ORDER BY created_at ASC
+            LIMIT 300""")
+        if not rows:
+            return
+        resolved = 0
+        for bid, match_id, created_at, action_type, entry_odd, stake in rows:
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            g10 = goal_in_window(conn, match_id, created_at, 600)
+            if action_type == "GOAL_WITHIN_10M":
+                win = bool(g10)
+                profit = (float(stake or 100) * (float(entry_odd or 2.0) - 1.0)) if win else -float(stake or 100)
+            else:
+                win = not bool(g10)
+                profit = float(stake or 100) * 0.80 if win else -float(stake or 100)
+            conn.run("""UPDATE simulated_bets SET
+                    validated=TRUE, status='closed', result=:result,
+                    goal_within_10m=:g10, virtual_profit=:profit, resolved_at=NOW()
+                WHERE id=:id""",
+                result='win' if win else 'loss', g10=g10, profit=round(profit, 2), id=bid)
+            resolved += 1
+        if resolved:
+            log.info(f"paper trading validation complete | resolved={resolved}")
+    except Exception as e:
+        log.error(f"validate_simulated_bets error: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def update_pattern_stats(conn, row, goal2, goal5, goal10, false_positive, pattern_id):
     try:
@@ -1465,6 +1591,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
     <button class="nav-btn nav-item active" onclick="showPage('live',this)"><span class="nav-icon">📡</span><span>Live Dashboard</span></button>
     <button class="nav-btn nav-item" onclick="showPage('goals',this)"><span class="nav-icon">⚽</span><span>Goals</span></button>
     <button class="nav-btn nav-item" onclick="showPage('signals',this)"><span class="nav-icon">🔥</span><span>Signals</span></button>
+    <button class="nav-btn nav-item" onclick="showPage('paper',this)"><span class="nav-icon">🧪</span><span>Paper Trades</span></button>
     <button class="nav-btn nav-item" onclick="showPage('analytics',this)"><span class="nav-icon">📊</span><span>Analytics</span></button>
     <button class="nav-btn nav-item" onclick="showPage('ai',this)"><span class="nav-icon">🤖</span><span>AI Insights</span></button>
   </nav>
@@ -1495,6 +1622,11 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
     <div class="page-header"><div><div class="page-title">🔥 All Signals</div><div class="page-sub">כל האותות מ-3 השעות האחרונות</div></div></div>
     <div id="signals-list"><div class="empty"><div class="empty-icon">🔥</div><div>טוען...</div></div></div>
   </div>
+  <div class="page" id="page-paper">
+    <div class="page-header"><div><div class="page-title">🧪 Paper Trading</div><div class="page-sub">פעולות דמיוניות בלבד — בדיקת הצלחה של ההמלצות בלי כסף אמיתי</div></div></div>
+    <div id="paper-stats" class="stats-row"></div>
+    <div id="paper-list"><div class="empty"><div class="empty-icon">🧪</div><div>טוען פעולות דמיוניות...</div></div></div>
+  </div>
   <div class="page" id="page-analytics">
     <div class="page-header"><div><div class="page-title">📊 Analytics</div><div class="page-sub">ניתוח היסטורי ולמידה מנתונים</div></div></div>
     <div id="analytics-content"><div class="empty"><div class="empty-icon">📊</div><div>טוען...</div></div></div>
@@ -1519,6 +1651,7 @@ function showPage(p,btn){
   currentPage=p;
   if(p==='goals') loadGoals();
   else if(p==='signals') loadSignals();
+  else if(p==='paper') loadPaper();
   else if(p==='analytics') loadAnalytics();
   else if(p==='ai') loadAI();
 }
@@ -1659,6 +1792,46 @@ async function loadSignals(){
   }catch(e){console.error(e);}
 }
 
+async function loadPaper(){
+  try{
+    const[stats,trades]=await Promise.all([
+      fetch('/api/paper_stats').then(r=>r.json()),
+      fetch('/api/paper_trades').then(r=>r.json())
+    ]);
+    const st=document.getElementById('paper-stats');
+    st.innerHTML=`
+      <div class="stat-card"><div class="stat-num" style="color:var(--blue)">${stats.total||0}</div><div class="stat-label">Total Paper Actions</div></div>
+      <div class="stat-card"><div class="stat-num" style="color:var(--green)">${stats.wins||0}</div><div class="stat-label">Wins</div></div>
+      <div class="stat-card"><div class="stat-num" style="color:var(--red)">${stats.losses||0}</div><div class="stat-label">Losses</div></div>
+      <div class="stat-card"><div class="stat-num" style="color:var(--yellow)">${(stats.success_rate||0).toFixed(1)}%</div><div class="stat-label">Success Rate</div></div>
+      <div class="stat-card"><div class="stat-num" style="color:var(--purple)">${(stats.virtual_profit||0).toFixed(0)}</div><div class="stat-label">Virtual Profit</div></div>
+      <div class="stat-card"><div class="stat-num" style="color:var(--muted)">${stats.open||0}</div><div class="stat-label">Open / Waiting</div></div>`;
+    const el=document.getElementById('paper-list');
+    if(!trades.length){el.innerHTML='<div class="empty"><div class="empty-icon">🧪</div><div>אין עדיין פעולות דמיוניות. הן ייווצרו אוטומטית מסיגנלים עם confidence 70%+</div></div>';return;}
+    el.innerHTML=trades.map(t=>{
+      const color=t.result==='win'?'var(--green)':(t.result==='loss'?'var(--red)':'var(--yellow)');
+      const label=t.validated?(t.result==='win'?'✅ נתפס':'❌ נכשל'):'⏳ ממתין לבדיקה';
+      return `<div class="sig-card">
+        <div class="sig-top">
+          <div>
+            <div style="font-size:14px;font-weight:700">${t.home_team||''} vs ${t.away_team||''}</div>
+            <div style="font-size:11px;color:var(--muted)">${t.league||''} · דקה ${t.minute||0} · ${t.score||''}</div>
+          </div>
+          <span class="badge" style="background:rgba(255,255,255,0.06);color:${color};border:1px solid ${color}">${label}</span>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+          <div class="odd-tag"><div class="odd-label">ACTION</div><div class="odd-val">${t.action_type}</div></div>
+          ${t.entry_odd?`<div class="odd-tag"><div class="odd-label">ODD</div><div class="odd-val">${Number(t.entry_odd).toFixed(2)}</div></div>`:''}
+          <div class="odd-tag"><div class="odd-label">CONF</div><div class="odd-val">${t.confidence||0}%</div></div>
+          <div class="odd-tag"><div class="odd-label">P/L</div><div class="odd-val" style="color:${(t.virtual_profit||0)>=0?'var(--green)':'var(--red)'}">${(t.virtual_profit||0).toFixed(0)}</div></div>
+        </div>
+        <div style="font-size:12px;color:var(--muted);margin-top:8px">${t.reason||''}</div>
+      </div>`;
+    }).join('');
+  }catch(e){console.error(e);}
+}
+
+
 async function loadAnalytics(){
   try{
     const data=await fetch('/api/analytics').then(r=>r.json());
@@ -1720,6 +1893,7 @@ async function runAI(){
 
 async function autoRefresh(){
   if(currentPage==='live') await loadLive();
+  else if(currentPage==='paper') await loadPaper();
 }
 loadLive();
 setInterval(autoRefresh,20000);
@@ -2107,6 +2281,62 @@ def api_ai_rules():
             conn.close()
     except Exception as e:
         return jsonify({"error": str(e), "rules": []}), 500
+
+@app.route("/api/paper_trades")
+def api_paper_trades():
+    try:
+        conn = get_db()
+        try:
+            rows = conn.run("""SELECT id, signal_id, match_id, created_at, resolved_at,
+                    home_team, away_team, league, minute, score, action_type, market,
+                    entry_odd, virtual_stake, virtual_profit, confidence, reason,
+                    status, result, goal_within_10m, validated
+                FROM simulated_bets
+                ORDER BY created_at DESC
+                LIMIT 200""")
+            cols = ["id","signal_id","match_id","created_at","resolved_at","home_team","away_team","league",
+                    "minute","score","action_type","market","entry_odd","virtual_stake","virtual_profit",
+                    "confidence","reason","status","result","goal_within_10m","validated"]
+            out=[]
+            for r in rows:
+                d=dict(zip(cols,r))
+                d["created_at"]=str(d["created_at"])
+                d["resolved_at"]=str(d["resolved_at"]) if d.get("resolved_at") else None
+                out.append(d)
+            return jsonify(out)
+        finally:
+            conn.close()
+    except Exception as e:
+        return jsonify({"error": str(e), "trades": []}), 500
+
+@app.route("/api/paper_stats")
+def api_paper_stats():
+    try:
+        conn = get_db()
+        try:
+            total = conn.run("SELECT COUNT(*) FROM simulated_bets")[0][0]
+            open_cnt = conn.run("SELECT COUNT(*) FROM simulated_bets WHERE COALESCE(validated,FALSE)=FALSE")[0][0]
+            wins = conn.run("SELECT COUNT(*) FROM simulated_bets WHERE result='win'")[0][0]
+            losses = conn.run("SELECT COUNT(*) FROM simulated_bets WHERE result='loss'")[0][0]
+            profit = conn.run("SELECT COALESCE(SUM(virtual_profit),0) FROM simulated_bets WHERE COALESCE(validated,FALSE)=TRUE")[0][0]
+            closed = int(wins or 0) + int(losses or 0)
+            rate = (float(wins or 0) / closed * 100.0) if closed else 0.0
+            by_action_rows = conn.run("""SELECT action_type, COUNT(*),
+                    SUM(CASE WHEN result='win' THEN 1 ELSE 0 END) AS wins
+                FROM simulated_bets
+                WHERE COALESCE(validated,FALSE)=TRUE
+                GROUP BY action_type
+                ORDER BY COUNT(*) DESC""")
+            by_action=[]
+            for a,c,w in by_action_rows:
+                c=int(c or 0); w=int(w or 0)
+                by_action.append({"action_type":a,"total":c,"wins":w,"success_rate":(w/c*100.0 if c else 0)})
+            return jsonify({"total":total,"open":open_cnt,"wins":wins,"losses":losses,
+                            "success_rate":rate,"virtual_profit":float(profit or 0),"by_action":by_action})
+        finally:
+            conn.close()
+    except Exception as e:
+        return jsonify({"error": str(e), "total": 0, "open": 0, "wins": 0, "losses": 0, "success_rate": 0, "virtual_profit": 0}), 500
 
 @app.route("/api/validation_stats")
 def api_validation_stats():
