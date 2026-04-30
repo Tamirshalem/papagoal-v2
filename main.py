@@ -1,5 +1,5 @@
 import os, time, json, logging, threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 from flask import Flask, jsonify, render_template_string, request
 import pg8000.native
@@ -161,6 +161,42 @@ def init_db():
             insight_type TEXT, content TEXT,
             goals_analyzed INT DEFAULT 0
         )""")
+        # --- Validation columns for learning engine ---
+        conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS checked_2m BOOLEAN DEFAULT FALSE")
+        conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS checked_5m BOOLEAN DEFAULT FALSE")
+        conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS checked_10m BOOLEAN DEFAULT FALSE")
+        conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS goal_2m BOOLEAN")
+        conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS goal_5m BOOLEAN")
+        conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS goal_10m BOOLEAN")
+        conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS validated BOOLEAN DEFAULT FALSE")
+        conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS false_positive BOOLEAN DEFAULT FALSE")
+        conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS failure_reason TEXT")
+        conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS pattern_id TEXT")
+        conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS validation_updated_at TIMESTAMPTZ")
+
+        conn.run("""CREATE TABLE IF NOT EXISTS pattern_stats (
+            id SERIAL PRIMARY KEY,
+            pattern_id TEXT UNIQUE,
+            rule_num INT,
+            rule_name TEXT,
+            minute_bucket TEXT,
+            odds_bucket TEXT,
+            pressure_bucket TEXT,
+            duration_bucket TEXT,
+            total_cases INT DEFAULT 0,
+            goals_2m INT DEFAULT 0,
+            goals_5m INT DEFAULT 0,
+            goals_10m INT DEFAULT 0,
+            no_goal_cases INT DEFAULT 0,
+            false_positive_cases INT DEFAULT 0,
+            success_rate_2m FLOAT DEFAULT 0,
+            success_rate_5m FLOAT DEFAULT 0,
+            success_rate_10m FLOAT DEFAULT 0,
+            confidence_level TEXT DEFAULT 'low',
+            last_updated TIMESTAMPTZ DEFAULT NOW()
+        )""")
+        conn.run("CREATE INDEX IF NOT EXISTS idx_pattern_stats_pid ON pattern_stats(pattern_id)")
+        conn.run("CREATE INDEX IF NOT EXISTS idx_signals_validation ON signals(validated, detected_at)")
         log.info("✅ DB ready")
     except Exception as e:
         log.error(f"DB init: {e}")
@@ -900,10 +936,199 @@ def collector_loop():
         fetch_betfair_ht()
     while True:
         collect()
+        validate_signals()
         fetch_live_football()
         if BETFAIR_APP_KEY:
             fetch_betfair_ht()
         time.sleep(POLL_INTERVAL)
+
+# --- Validation + Pattern Learning Engine -----------------------------------
+def bucket_minute(minute):
+    try:
+        m = int(minute or 0)
+    except Exception:
+        m = 0
+    return f"m{(m // 5) * 5:02d}"
+
+def bucket_odd(odd):
+    try:
+        o = float(odd or 0)
+    except Exception:
+        o = 0
+    if o <= 0:
+        return "o000"
+    return f"o{int(round(o * 10) * 10):03d}"
+
+def bucket_pressure(pressure):
+    try:
+        p = int(pressure or 0)
+    except Exception:
+        p = 0
+    return f"p{(p // 10) * 10:02d}"
+
+def bucket_duration(seconds):
+    try:
+        s = int(seconds or 0)
+    except Exception:
+        s = 0
+    if s < 30:
+        return "d00"
+    if s < 60:
+        return "d30"
+    if s < 120:
+        return "d60"
+    if s < 180:
+        return "d120"
+    return "d180"
+
+def build_pattern_id(rule_num, minute, over_odd, pressure, held_seconds):
+    return "__".join([
+        f"rule{int(rule_num or 0)}",
+        bucket_minute(minute),
+        bucket_odd(over_odd),
+        bucket_pressure(pressure),
+        bucket_duration(held_seconds),
+    ])
+
+def goal_in_window(conn, match_id, start_ts, seconds):
+    try:
+        rows = conn.run("""SELECT 1 FROM goals
+            WHERE match_id=:a
+            AND recorded_at >= :b
+            AND recorded_at <= (:b + (:c * INTERVAL '1 second'))
+            LIMIT 1""", a=match_id, b=start_ts, c=int(seconds))
+        return bool(rows)
+    except Exception as e:
+        log.error(f"goal_in_window error match={match_id}: {e}")
+        return False
+
+def failure_reason_for_signal(signal_type, direction, held_seconds, pressure, over_odd):
+    reasons = []
+    if direction == "up":
+        reasons.append("market reversed upward")
+    if held_seconds is not None and held_seconds < 60:
+        reasons.append("duration too short")
+    if pressure is not None and pressure < 30:
+        reasons.append("low pressure score")
+    if over_odd is None or over_odd <= 0:
+        reasons.append("missing over odds")
+    if signal_type == "trap":
+        reasons.append("trap-style signal")
+    return "; ".join(reasons) if reasons else "goal did not occur within validation window"
+
+def update_pattern_stats(conn, row, goal2, goal5, goal10, false_positive, pattern_id):
+    try:
+        conn.run("""INSERT INTO pattern_stats
+            (pattern_id, rule_num, rule_name, minute_bucket, odds_bucket, pressure_bucket, duration_bucket,
+             total_cases, goals_2m, goals_5m, goals_10m, no_goal_cases, false_positive_cases,
+             success_rate_2m, success_rate_5m, success_rate_10m, confidence_level, last_updated)
+            VALUES
+            (:pid, :rn, :rname, :mb, :ob, :pb, :db,
+             1, :g2, :g5, :g10, :ng, :fp,
+             :sr2, :sr5, :sr10, 'low', NOW())
+            ON CONFLICT (pattern_id) DO UPDATE SET
+                total_cases = pattern_stats.total_cases + 1,
+                goals_2m = pattern_stats.goals_2m + EXCLUDED.goals_2m,
+                goals_5m = pattern_stats.goals_5m + EXCLUDED.goals_5m,
+                goals_10m = pattern_stats.goals_10m + EXCLUDED.goals_10m,
+                no_goal_cases = pattern_stats.no_goal_cases + EXCLUDED.no_goal_cases,
+                false_positive_cases = pattern_stats.false_positive_cases + EXCLUDED.false_positive_cases,
+                success_rate_2m = ((pattern_stats.goals_2m + EXCLUDED.goals_2m)::float / (pattern_stats.total_cases + 1)) * 100,
+                success_rate_5m = ((pattern_stats.goals_5m + EXCLUDED.goals_5m)::float / (pattern_stats.total_cases + 1)) * 100,
+                success_rate_10m = ((pattern_stats.goals_10m + EXCLUDED.goals_10m)::float / (pattern_stats.total_cases + 1)) * 100,
+                confidence_level = CASE
+                    WHEN pattern_stats.total_cases + 1 >= 100 THEN 'very_high'
+                    WHEN pattern_stats.total_cases + 1 >= 30 THEN 'high'
+                    WHEN pattern_stats.total_cases + 1 >= 10 THEN 'medium'
+                    ELSE 'low'
+                END,
+                last_updated = NOW()""",
+            pid=pattern_id,
+            rn=row.get("rule_num"), rname=row.get("rule_name") or "",
+            mb=bucket_minute(row.get("minute")),
+            ob=bucket_odd(row.get("over_odd")),
+            pb=bucket_pressure(row.get("pressure_score")),
+            db=bucket_duration(row.get("held_seconds")),
+            g2=1 if goal2 else 0,
+            g5=1 if goal5 else 0,
+            g10=1 if goal10 else 0,
+            ng=0 if goal10 else 1,
+            fp=1 if false_positive else 0,
+            sr2=100.0 if goal2 else 0.0,
+            sr5=100.0 if goal5 else 0.0,
+            sr10=100.0 if goal10 else 0.0)
+        log.info(f"PatternStats updated {pattern_id} | g2={goal2} g5={goal5} g10={goal10} fp={false_positive}")
+    except Exception as e:
+        log.error(f"update_pattern_stats error pattern={pattern_id}: {e}")
+
+def validate_signals():
+    try:
+        conn = get_db()
+    except Exception as e:
+        log.error(f"validate_signals DB connect error: {e}")
+        return
+    try:
+        rows = conn.run("""SELECT id, match_id, detected_at, checked_2m, checked_5m, checked_10m,
+                rule_num, rule_name, minute, signal_type, confidence, over_odd,
+                pressure_score, held_seconds, direction, pattern_id
+            FROM signals
+            WHERE COALESCE(validated, FALSE)=FALSE
+            AND match_id IS NOT NULL
+            AND detected_at < NOW() - INTERVAL '2 minutes'
+            ORDER BY detected_at ASC
+            LIMIT 300""")
+        if not rows:
+            return
+        cols = ["id","match_id","detected_at","checked_2m","checked_5m","checked_10m",
+                "rule_num","rule_name","minute","signal_type","confidence","over_odd",
+                "pressure_score","held_seconds","direction","pattern_id"]
+        now = datetime.now(timezone.utc)
+        staged = finalised = 0
+        for raw in rows:
+            row = dict(zip(cols, raw))
+            sid = row["id"]
+            detected_at = row["detected_at"]
+            if detected_at.tzinfo is None:
+                detected_at = detected_at.replace(tzinfo=timezone.utc)
+            elapsed = (now - detected_at).total_seconds()
+            if not row.get("checked_2m") and elapsed >= 120:
+                g2 = goal_in_window(conn, row["match_id"], detected_at, 120)
+                conn.run("""UPDATE signals SET checked_2m=TRUE, goal_2m=:g,
+                    validation_updated_at=NOW() WHERE id=:id""", g=g2, id=sid)
+                staged += 1
+                log.info(f"Signal {sid} checked 2m | goal={g2}")
+            if not row.get("checked_5m") and elapsed >= 300:
+                g5 = goal_in_window(conn, row["match_id"], detected_at, 300)
+                conn.run("""UPDATE signals SET checked_5m=TRUE, goal_5m=:g,
+                    validation_updated_at=NOW() WHERE id=:id""", g=g5, id=sid)
+                staged += 1
+                log.info(f"Signal {sid} checked 5m | goal={g5}")
+            if not row.get("checked_10m") and elapsed >= 600:
+                g2 = goal_in_window(conn, row["match_id"], detected_at, 120)
+                g5 = goal_in_window(conn, row["match_id"], detected_at, 300)
+                g10 = goal_in_window(conn, row["match_id"], detected_at, 600)
+                false_positive = bool(row.get("signal_type") == "goal" and int(row.get("confidence") or 0) >= 50 and not g10)
+                reason = failure_reason_for_signal(row.get("signal_type"), row.get("direction"), row.get("held_seconds"), row.get("pressure_score"), row.get("over_odd")) if false_positive else None
+                pattern_id = row.get("pattern_id") or build_pattern_id(row.get("rule_num"), row.get("minute"), row.get("over_odd"), row.get("pressure_score"), row.get("held_seconds"))
+                conn.run("""UPDATE signals SET
+                        checked_2m=TRUE, checked_5m=TRUE, checked_10m=TRUE,
+                        goal_2m=:g2, goal_5m=:g5, goal_10m=:g10,
+                        validated=TRUE, false_positive=:fp, failure_reason=:fr,
+                        pattern_id=:pid, validation_updated_at=NOW()
+                    WHERE id=:id""",
+                    g2=g2, g5=g5, g10=g10, fp=false_positive, fr=reason, pid=pattern_id, id=sid)
+                update_pattern_stats(conn, row, g2, g5, g10, false_positive, pattern_id)
+                finalised += 1
+                log.info(f"VALIDATED signal {sid} | pattern={pattern_id} | goal10={g10} | fp={false_positive}")
+        if staged or finalised:
+            log.info(f"validation cycle complete | staged={staged} finalised={finalised}")
+    except Exception as e:
+        log.error(f"validate_signals error: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 # ─── Dashboard HTML ───────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
@@ -1489,6 +1714,59 @@ def api_debug_linking():
         log.error(f"debug_linking error: {e}")
         return jsonify({"error": str(e), "live_fixtures": len(live_data), "rows": []}), 500
 
+
+@app.route("/api/validation_stats")
+def api_validation_stats():
+    try:
+        conn = get_db()
+        try:
+            pending = conn.run("SELECT COUNT(*) FROM signals WHERE COALESCE(validated,FALSE)=FALSE")[0][0]
+            partial = conn.run("""SELECT COUNT(*) FROM signals
+                WHERE COALESCE(validated,FALSE)=FALSE
+                AND (COALESCE(checked_2m,FALSE)=TRUE OR COALESCE(checked_5m,FALSE)=TRUE)""")[0][0]
+            full = conn.run("SELECT COUNT(*) FROM signals WHERE COALESCE(validated,FALSE)=TRUE")[0][0]
+            patterns = conn.run("SELECT COUNT(*) FROM pattern_stats")[0][0]
+            fp = conn.run("SELECT COUNT(*) FROM signals WHERE COALESCE(false_positive,FALSE)=TRUE")[0][0]
+            last = conn.run("SELECT MAX(last_updated) FROM pattern_stats")[0][0]
+            return jsonify({
+                "pending": pending,
+                "partial": partial,
+                "fully_validated": full,
+                "pattern_stats_rows": patterns,
+                "false_positives": fp,
+                "last_pattern_update": str(last) if last else None
+            })
+        finally:
+            conn.close()
+    except Exception as e:
+        return jsonify({"error": str(e), "pending": 0, "partial": 0, "fully_validated": 0, "pattern_stats_rows": 0})
+
+@app.route("/api/patterns")
+def api_patterns():
+    try:
+        conn = get_db()
+        try:
+            rows = conn.run("""SELECT pattern_id, rule_num, rule_name, minute_bucket, odds_bucket,
+                    pressure_bucket, duration_bucket, total_cases, goals_2m, goals_5m, goals_10m,
+                    no_goal_cases, false_positive_cases, success_rate_2m, success_rate_5m,
+                    success_rate_10m, confidence_level, last_updated
+                FROM pattern_stats
+                ORDER BY total_cases DESC, success_rate_5m DESC
+                LIMIT 100""")
+            cols = ["pattern_id","rule_num","rule_name","minute_bucket","odds_bucket","pressure_bucket",
+                    "duration_bucket","total_cases","goals_2m","goals_5m","goals_10m","no_goal_cases",
+                    "false_positive_cases","success_rate_2m","success_rate_5m","success_rate_10m",
+                    "confidence_level","last_updated"]
+            result = []
+            for r in rows:
+                d = dict(zip(cols, r))
+                d["last_updated"] = str(d["last_updated"])
+                result.append(d)
+            return jsonify(result)
+        finally:
+            conn.close()
+    except Exception:
+        return jsonify([])
 
 @app.route("/health")
 def health():
