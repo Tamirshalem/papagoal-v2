@@ -422,6 +422,19 @@ last_scores = {}
 opening_odds_cache = {}  # match_id -> {market: odd}
 betfair_ht_odds = {}     # match_id -> {over05ht, over15ht}
 
+# Dashboard visibility for the data pipeline.
+# This explains the difference between all API-Football live fixtures
+# and only the live matches that have successfully linked odds.
+last_pipeline_stats = {
+    "live_fixtures": 0,
+    "odds_games": 0,
+    "linked_live": 0,
+    "untracked_live": 0,
+    "last_odds_update": None,
+    "linked_examples": [],
+    "unlinked_examples": [],
+}
+
 def fetch_live_football():
     """Fetch live fixtures from API-Football and keep raw team names for robust linking."""
     if not FOOTBALL_API_KEY:
@@ -705,6 +718,8 @@ def collect():
 
         games = r.json()
         live_cnt = 0
+        linked_examples = []
+        unlinked_examples = []
         conn = get_db()
         try:
             for game in games:
@@ -714,6 +729,11 @@ def collect():
                 min_, score, hg, ag, league, is_live = get_live(home, away)
                 if is_live:
                     live_cnt += 1
+                    if len(linked_examples) < 5:
+                        linked_examples.append(f"{home} vs {away}")
+                else:
+                    if len(unlinked_examples) < 8:
+                        unlinked_examples.append(f"{home} vs {away}")
 
                 # Get HT odds from Betfair
                 ht = get_ht_odds(home, away)
@@ -925,7 +945,17 @@ Over 2.5: {over_odd} | Draw: {draw_odd}
                         except Exception as e:
                             log.error(f"AI error: {e}")
 
-            log.info(f"✅ Saved | live:{live_cnt}/{len(games)}")
+            global last_pipeline_stats
+            last_pipeline_stats = {
+                "live_fixtures": len(live_data),
+                "odds_games": len(games),
+                "linked_live": live_cnt,
+                "untracked_live": max(0, len(live_data) - live_cnt),
+                "last_odds_update": datetime.now(timezone.utc).isoformat(),
+                "linked_examples": linked_examples,
+                "unlinked_examples": unlinked_examples,
+            }
+            log.info(f"✅ Saved | live:{live_cnt}/{len(games)} | fixtures:{len(live_data)} | untracked:{max(0, len(live_data)-live_cnt)}")
         finally:
             conn.close()
     except Exception as e:
@@ -1161,7 +1191,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
 .page-header{margin-bottom:20px;display:flex;justify-content:space-between;align-items:flex-start}
 .page-title{font-size:22px;font-weight:700}
 .page-sub{font-size:12px;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-top:4px}
-.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
+.stats-row{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:20px}
 .stat-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px}
 .stat-num{font-size:26px;font-weight:900;font-family:'JetBrains Mono',monospace}
 .stat-label{font-size:11px;color:var(--muted);margin-top:4px}
@@ -1245,11 +1275,14 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
       <div class="upd-time" id="upd-live">מתעדכן...</div>
     </div>
     <div class="stats-row">
-      <div class="stat-card"><div class="stat-num" style="color:var(--blue)" id="sl-live">—</div><div class="stat-label">Live Matches</div></div>
-      <div class="stat-card"><div class="stat-num" style="color:var(--green)" id="sl-hot">—</div><div class="stat-label">HOT Signals</div></div>
+      <div class="stat-card"><div class="stat-num" style="color:var(--blue)" id="sl-fixtures">—</div><div class="stat-label">Live Fixtures</div></div>
+      <div class="stat-card"><div class="stat-num" style="color:var(--green)" id="sl-live">—</div><div class="stat-label">Tracked With Odds</div></div>
+      <div class="stat-card"><div class="stat-num" style="color:var(--orange)" id="sl-untracked">—</div><div class="stat-label">Live Without Odds</div></div>
+      <div class="stat-card"><div class="stat-num" style="color:var(--muted)" id="sl-odds-games">—</div><div class="stat-label">Odds Games</div></div>
       <div class="stat-card"><div class="stat-num" style="color:var(--yellow)" id="sl-goals">—</div><div class="stat-label">Goals Today</div></div>
       <div class="stat-card"><div class="stat-num" style="color:var(--purple)" id="sl-snaps">—</div><div class="stat-label">Snapshots</div></div>
     </div>
+    <div id="pipeline-debug" class="match-card" style="margin-bottom:16px;display:none"></div>
     <div class="section-title">🎯 המלצות – משחקים חיים בלבד</div>
     <div id="live-cards"><div class="empty"><div class="empty-icon">📡</div><div>סורק משחקים חיים...</div></div></div>
   </div>
@@ -1296,16 +1329,34 @@ async function loadLive(){
       fetch('/api/signals').then(r=>r.json()),
       fetch('/api/ai_live').then(r=>r.json())
     ]);
-    document.getElementById('sl-live').textContent=st.live||0;
-    document.getElementById('sl-hot').textContent=st.hot_signals||0;
+    document.getElementById('sl-fixtures').textContent=st.live_fixtures||0;
+    document.getElementById('sl-live').textContent=st.tracked_with_odds||st.live||0;
+    document.getElementById('sl-untracked').textContent=st.untracked_live||0;
+    document.getElementById('sl-odds-games').textContent=st.odds_games||0;
     document.getElementById('sl-goals').textContent=st.goals_today||0;
     document.getElementById('sl-snaps').textContent=(st.snapshots||0).toLocaleString();
+    const dbg=document.getElementById('pipeline-debug');
+    if(dbg){
+      const linked=(st.linked_examples||[]).slice(0,3).join(' · ');
+      const unlinked=(st.unlinked_examples||[]).slice(0,4).join(' · ');
+      dbg.style.display='block';
+      dbg.innerHTML=`<div class="section-title">🔎 Data Pipeline Status</div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;font-size:12px">
+          <div><span style="color:var(--muted)">API-Football Live</span><br><b style="color:var(--blue)">${st.live_fixtures||0}</b></div>
+          <div><span style="color:var(--muted)">Odds API Games</span><br><b>${st.odds_games||0}</b></div>
+          <div><span style="color:var(--muted)">Linked Live Odds</span><br><b style="color:var(--green)">${st.tracked_with_odds||0}</b></div>
+          <div><span style="color:var(--muted)">Untracked Live</span><br><b style="color:var(--orange)">${st.untracked_live||0}</b></div>
+        </div>
+        ${linked?`<div style="margin-top:10px;font-size:11px;color:var(--green)">Linked: ${linked}</div>`:''}
+        ${unlinked?`<div style="margin-top:6px;font-size:11px;color:var(--muted)">Odds not live/linked: ${unlinked}</div>`:''}
+        ${(st.live_fixtures||0)>0 && (st.tracked_with_odds||0)===0?`<div style="margin-top:10px;font-size:12px;color:var(--orange)">⚠️ יש משחקים חיים, אבל אין להם odds מחוברים כרגע.</div>`:''}`;
+    }
     document.getElementById('upd-live').textContent='עדכון: '+new Date().toLocaleTimeString('he-IL');
     const aiMap={};
     ai.forEach(a=>aiMap[a.match_id]=a.analysis);
     const el=document.getElementById('live-cards');
     if(!si.length){
-      el.innerHTML='<div class="empty"><div class="empty-icon">✅</div><div style="font-size:15px;font-weight:700;margin-bottom:6px">אין אותות פעילים כרגע</div><div style="font-size:12px">עוקב אחרי '+(st.live||0)+' משחקים חיים</div></div>';
+      el.innerHTML='<div class="empty"><div class="empty-icon">✅</div><div style="font-size:15px;font-weight:700;margin-bottom:6px">אין אותות פעילים כרגע</div><div style="font-size:12px">עוקב אחרי '+(st.live_fixtures||0)+' משחקים חיים · '+(st.tracked_with_odds||st.live||0)+' עם odds</div></div>';
       return;
     }
     const byMatch={};
@@ -1489,9 +1540,29 @@ def api_stats():
             r2 = conn.run("SELECT COUNT(*) FROM signals WHERE detected_at>NOW()-INTERVAL '30 minutes' AND signal_type='goal' AND confidence>=75")
             r3 = conn.run("SELECT COUNT(*) FROM goals WHERE recorded_at>NOW()-INTERVAL '24 hours'")
             r4 = conn.run("SELECT COUNT(*) FROM odds_snapshots")
-            return jsonify({"live":r1[0][0],"hot_signals":r2[0][0],"goals_today":r3[0][0],"snapshots":r4[0][0]})
+            tracked = int(r1[0][0] or 0)
+            live_fixtures = int(last_pipeline_stats.get("live_fixtures") or len(live_data) or 0)
+            odds_games = int(last_pipeline_stats.get("odds_games") or 0)
+            linked_live = int(last_pipeline_stats.get("linked_live") or tracked or 0)
+            untracked_live = max(0, live_fixtures - linked_live)
+            return jsonify({
+                "live": tracked,
+                "live_fixtures": live_fixtures,
+                "odds_games": odds_games,
+                "tracked_with_odds": tracked,
+                "linked_live": linked_live,
+                "untracked_live": untracked_live,
+                "hot_signals": r2[0][0],
+                "goals_today": r3[0][0],
+                "snapshots": r4[0][0],
+                "last_odds_update": last_pipeline_stats.get("last_odds_update"),
+                "linked_examples": last_pipeline_stats.get("linked_examples", []),
+                "unlinked_examples": last_pipeline_stats.get("unlinked_examples", []),
+            })
         finally: conn.close()
-    except: return jsonify({"live":0,"hot_signals":0,"goals_today":0,"snapshots":0})
+    except Exception as e:
+        log.error(f"api_stats error: {e}")
+        return jsonify({"live":0,"live_fixtures":len(live_data),"odds_games":0,"tracked_with_odds":0,"untracked_live":len(live_data),"hot_signals":0,"goals_today":0,"snapshots":0})
 
 @app.route("/api/signals")
 def api_signals():
