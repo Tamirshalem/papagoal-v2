@@ -4,6 +4,9 @@ from urllib.parse import urlparse
 from flask import Flask, jsonify, render_template_string, request
 import pg8000.native
 import requests
+import re
+import unicodedata
+from difflib import SequenceMatcher
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 ODDS_API_KEY      = os.environ.get("ODDS_API_KEY", "")
@@ -381,32 +384,62 @@ opening_odds_cache = {}  # match_id -> {market: odd}
 betfair_ht_odds = {}     # match_id -> {over05ht, over15ht}
 
 def fetch_live_football():
+    """Fetch live fixtures from API-Football and keep raw team names for robust linking."""
     if not FOOTBALL_API_KEY:
+        log.warning("FOOTBALL_API_KEY missing")
         return
     try:
-        r = requests.get("https://v3.football.api-sports.io/fixtures",
-                        headers={"x-apisports-key": FOOTBALL_API_KEY},
-                        params={"live": "all"}, timeout=10)
+        r = requests.get(
+            "https://v3.football.api-sports.io/fixtures",
+            headers={"x-apisports-key": FOOTBALL_API_KEY},
+            params={"live": "all"},
+            timeout=10
+        )
         if r.status_code != 200:
+            log.warning(f"Football API status: {r.status_code} body={r.text[:200]}")
             return
+
         live_data.clear()
         for f in r.json().get("response", []):
             try:
                 home = f["teams"]["home"]["name"]
                 away = f["teams"]["away"]["name"]
-                min_ = f["fixture"]["status"]["elapsed"] or 0
-                hg   = f["goals"]["home"] or 0
-                ag   = f["goals"]["away"] or 0
-                key  = f"{home}_{away}"
+                status = f["fixture"]["status"] or {}
+                min_ = status.get("elapsed") or 0
+                extra = status.get("extra")
+                short = status.get("short") or ""
+                long_status = status.get("long") or ""
+
+                hg = f["goals"]["home"] or 0
+                ag = f["goals"]["away"] or 0
+                league = f["league"]["name"]
+
+                key = f"{home}_{away}"
                 live_data[key] = {
-                    "minute": min_, "score": f"{hg}-{ag}",
-                    "hg": hg, "ag": ag,
-                    "league": f["league"]["name"],
-                    "h1": home.split()[0].lower(),
-                    "a1": away.split()[0].lower()
+                    "home_team": home,
+                    "away_team": away,
+                    "home_norm": normalize_team_name(home),
+                    "away_norm": normalize_team_name(away),
+                    "minute": min_,
+                    "extra": extra,
+                    "status_short": short,
+                    "status_long": long_status,
+                    "score": f"{hg}-{ag}",
+                    "hg": hg,
+                    "ag": ag,
+                    "league": league,
+                    "league_norm": normalize_team_name(league),
                 }
-            except: continue
+            except Exception as e:
+                log.warning(f"Skipping malformed fixture: {e}")
+                continue
+
         log.info(f"⏱ {len(live_data)} live fixtures")
+        if live_data:
+            sample = list(live_data.values())[:5]
+            log.info("Live sample: " + " | ".join(
+                [f"{x['home_team']} vs {x['away_team']} {x['minute']}' {x['score']}" for x in sample]
+            ))
     except Exception as e:
         log.error(f"Football API: {e}")
 
@@ -466,16 +499,121 @@ def fetch_betfair_ht():
     except Exception as e:
         log.error(f"Betfair HT error: {e}")
 
+def normalize_team_name(name):
+    """Normalize team/league names from different providers for fuzzy matching."""
+    if not name:
+        return ""
+
+    name = unicodedata.normalize("NFKD", str(name))
+    name = "".join(c for c in name if not unicodedata.combining(c))
+    name = name.lower()
+
+    replacements = {
+        "&": " and ",
+        "+": " ",
+        " v ": " ",
+        " vs ": " ",
+    }
+    for src, dst in replacements.items():
+        name = name.replace(src, dst)
+
+    name = re.sub(r"[^a-z0-9\s]", " ", name)
+
+    remove_words = {
+        "fc", "cf", "sc", "afc", "club", "deportivo", "athletic",
+        "u19", "u20", "u21", "u23", "women", "woman", "w",
+        "reserves", "reserve", "youth", "academy",
+        "b", "ii", "iii", "the"
+    }
+
+    parts = []
+    for p in name.split():
+        if p in remove_words:
+            continue
+        if len(p) <= 1:
+            continue
+        parts.append(p)
+
+    return " ".join(parts).strip()
+
+
+def similarity(a, b):
+    a = normalize_team_name(a)
+    b = normalize_team_name(b)
+
+    if not a or not b:
+        return 0
+    if a == b:
+        return 100
+    if a in b or b in a:
+        return 88
+
+    a_tokens = set(a.split())
+    b_tokens = set(b.split())
+    token_score = 0
+    if a_tokens and b_tokens:
+        overlap = len(a_tokens & b_tokens)
+        token_score = int((2 * overlap / (len(a_tokens) + len(b_tokens))) * 100)
+
+    seq_score = int(SequenceMatcher(None, a, b).ratio() * 100)
+    return max(token_score, seq_score)
+
+
 def get_live(home, away):
-    key = f"{home}_{away}"
-    if key in live_data:
-        d = live_data[key]
+    """
+    Link an Odds API game to an API-Football live fixture.
+    This replaces weak first-token matching with robust fuzzy matching.
+    """
+    if not live_data:
+        return 0, "0-0", 0, 0, "", False
+
+    # Fast exact key match first
+    exact_key = f"{home}_{away}"
+    if exact_key in live_data:
+        d = live_data[exact_key]
         return d["minute"], d["score"], d["hg"], d["ag"], d["league"], True
-    h1 = home.split()[0].lower()
-    a1 = away.split()[0].lower()
-    for v in live_data.values():
-        if h1 in v.get("h1","") or a1 in v.get("a1",""):
-            return v["minute"], v["score"], v["hg"], v["ag"], v["league"], True
+
+    best = None
+    best_score = 0
+    best_detail = ""
+
+    for _, v in live_data.items():
+        live_home = v.get("home_team", "")
+        live_away = v.get("away_team", "")
+
+        home_score = similarity(home, live_home)
+        away_score = similarity(away, live_away)
+        direct_score = (home_score + away_score) / 2
+
+        # Some providers can swap home/away names in neutral venues or markets
+        rev_home_score = similarity(home, live_away)
+        rev_away_score = similarity(away, live_home)
+        reversed_score = (rev_home_score + rev_away_score) / 2
+
+        score = max(direct_score, reversed_score)
+        detail = (
+            f"candidate={live_home} vs {live_away} "
+            f"direct={direct_score:.1f} reversed={reversed_score:.1f}"
+        )
+
+        if score > best_score:
+            best_score = score
+            best = v
+            best_detail = detail
+
+    # Require both teams to match reasonably well via combined score.
+    # 65 is permissive enough for provider naming differences but avoids random one-team matches.
+    if best and best_score >= 65:
+        log.info(
+            f"🔗 MATCH LINKED odds='{home} vs {away}' -> "
+            f"api='{best['home_team']} vs {best['away_team']}' score={best_score:.1f}"
+        )
+        return best["minute"], best["score"], best["hg"], best["ag"], best["league"], True
+
+    log.warning(
+        f"❌ NO LIVE LINK for odds='{home} vs {away}' "
+        f"best_score={best_score:.1f} {best_detail}"
+    )
     return 0, "0-0", 0, 0, "", False
 
 def get_ht_odds(home, away):
@@ -1295,6 +1433,62 @@ def api_run_ai():
         finally: conn.close()
     except Exception as e:
         return jsonify({"error":str(e)}),500
+
+
+@app.route("/api/debug_linking")
+def api_debug_linking():
+    """Show why Odds API games are or are not linking to API-Football fixtures."""
+    try:
+        fetch_live_football()
+        r = requests.get(
+            "https://api.the-odds-api.com/v4/sports/soccer/odds/",
+            params={
+                "apiKey": ODDS_API_KEY,
+                "regions": "eu",
+                "markets": "h2h,totals",
+                "oddsFormat": "decimal",
+                "dateFormat": "iso"
+            },
+            timeout=15
+        )
+        odds_games = r.json() if r.status_code == 200 else []
+        rows = []
+
+        for game in odds_games[:30]:
+            home = game.get("home_team", "")
+            away = game.get("away_team", "")
+
+            best = None
+            best_score = 0
+            for _, v in live_data.items():
+                direct = (similarity(home, v.get("home_team", "")) + similarity(away, v.get("away_team", ""))) / 2
+                rev = (similarity(home, v.get("away_team", "")) + similarity(away, v.get("home_team", ""))) / 2
+                score = max(direct, rev)
+                if score > best_score:
+                    best_score = score
+                    best = v
+
+            rows.append({
+                "odds_home": home,
+                "odds_away": away,
+                "best_api_home": best.get("home_team") if best else None,
+                "best_api_away": best.get("away_team") if best else None,
+                "best_score": round(best_score, 1),
+                "linked": best_score >= 65,
+                "minute": best.get("minute") if best else None,
+                "score": best.get("score") if best else None,
+            })
+
+        return jsonify({
+            "live_fixtures": len(live_data),
+            "odds_games": len(odds_games),
+            "linked_count": sum(1 for x in rows if x["linked"]),
+            "rows": rows
+        })
+    except Exception as e:
+        log.error(f"debug_linking error: {e}")
+        return jsonify({"error": str(e), "live_fixtures": len(live_data), "rows": []}), 500
+
 
 @app.route("/health")
 def health():
