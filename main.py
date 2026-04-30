@@ -551,75 +551,126 @@ def fetch_betfair_ht():
     except Exception as e:
         log.error(f"Betfair HT error: {e}")
 
+TEAM_ALIASES = {
+    # Common provider naming differences
+    "club universitario de deportes": "universitario",
+    "universitario de deportes": "universitario",
+    "nacional de montevideo": "club nacional",
+    "nacional montevideo": "club nacional",
+    "club nacional de football": "club nacional",
+    "la fc": "los angeles fc",
+    "lafc": "los angeles fc",
+    "los angeles": "los angeles fc",
+    "america women": "america w",
+    "america femenil": "america w",
+    "juarez women": "juarez w",
+    "juarez femenil": "juarez w",
+}
+
+STOP_TEAM_WORDS = {
+    "fc", "cf", "sc", "afc", "club", "cd", "ac", "as", "fk", "ik", "if", "bk",
+    "de", "da", "do", "del", "la", "le", "the", "real", "sporting",
+    "deportivo", "athletic", "atletico", "atlético",
+    "u17", "u18", "u19", "u20", "u21", "u23",
+    "women", "woman", "femenil", "feminino", "feminina", "w",
+    "reserves", "reserve", "youth", "academy",
+    "ii", "iii", "b"
+}
+
+IMPORTANT_SHORT_TOKENS = {"la", "ny", "psg", "usa"}
+
+
 def normalize_team_name(name):
-    """Normalize team/league names from different providers for fuzzy matching."""
+    """Normalize team names from different providers for reliable matching."""
     if not name:
         return ""
 
-    name = unicodedata.normalize("NFKD", str(name))
-    name = "".join(c for c in name if not unicodedata.combining(c))
-    name = name.lower()
+    raw = str(name).strip().lower()
+    raw = unicodedata.normalize("NFKD", raw)
+    raw = "".join(c for c in raw if not unicodedata.combining(c))
 
-    replacements = {
-        "&": " and ",
-        "+": " ",
-        " v ": " ",
-        " vs ": " ",
-    }
-    for src, dst in replacements.items():
-        name = name.replace(src, dst)
+    raw = raw.replace("&", " and ").replace("+", " ")
+    raw = re.sub(r"\b(v|vs)\b", " ", raw)
+    raw = re.sub(r"[^a-z0-9\s]", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
 
-    name = re.sub(r"[^a-z0-9\s]", " ", name)
-
-    remove_words = {
-        "fc", "cf", "sc", "afc", "club", "deportivo", "athletic",
-        "u19", "u20", "u21", "u23", "women", "woman", "w",
-        "reserves", "reserve", "youth", "academy",
-        "b", "ii", "iii", "the"
-    }
+    if raw in TEAM_ALIASES:
+        raw = TEAM_ALIASES[raw]
 
     parts = []
-    for p in name.split():
-        if p in remove_words:
+    for token in raw.split():
+        if token in STOP_TEAM_WORDS:
             continue
-        if len(p) <= 1:
+        if len(token) <= 1 and token not in IMPORTANT_SHORT_TOKENS:
             continue
-        parts.append(p)
+        parts.append(token)
 
-    return " ".join(parts).strip()
+    normalized = " ".join(parts).strip()
+    return TEAM_ALIASES.get(normalized, normalized)
 
 
-def similarity(a, b):
-    a = normalize_team_name(a)
-    b = normalize_team_name(b)
-
-    if not a or not b:
+def token_set_score(a, b):
+    """Lightweight fuzzy token-set score; no extra dependency required."""
+    a_norm = normalize_team_name(a)
+    b_norm = normalize_team_name(b)
+    if not a_norm or not b_norm:
         return 0
-    if a == b:
+    if a_norm == b_norm:
         return 100
-    if a in b or b in a:
-        return 88
+    if a_norm in b_norm or b_norm in a_norm:
+        return 92
 
-    a_tokens = set(a.split())
-    b_tokens = set(b.split())
-    token_score = 0
-    if a_tokens and b_tokens:
-        overlap = len(a_tokens & b_tokens)
-        token_score = int((2 * overlap / (len(a_tokens) + len(b_tokens))) * 100)
+    a_tokens = set(a_norm.split())
+    b_tokens = set(b_norm.split())
+    if not a_tokens or not b_tokens:
+        return 0
 
-    seq_score = int(SequenceMatcher(None, a, b).ratio() * 100)
-    return max(token_score, seq_score)
+    inter = a_tokens & b_tokens
+    union = a_tokens | b_tokens
+    jaccard = int(len(inter) / len(union) * 100)
+    dice = int((2 * len(inter) / (len(a_tokens) + len(b_tokens))) * 100)
+    seq = int(SequenceMatcher(None, a_norm, b_norm).ratio() * 100)
+
+    containment = 0
+    if inter:
+        containment = int(len(inter) / min(len(a_tokens), len(b_tokens)) * 100)
+
+    return max(jaccard, dice, seq, containment)
+
+
+def match_pair_score(odds_home, odds_away, live_home, live_away):
+    """Return best pair score and details. Requires BOTH teams to be plausible."""
+    dh = token_set_score(odds_home, live_home)
+    da = token_set_score(odds_away, live_away)
+    direct_min = min(dh, da)
+    direct_avg = (dh + da) / 2
+
+    rh = token_set_score(odds_home, live_away)
+    ra = token_set_score(odds_away, live_home)
+    rev_min = min(rh, ra)
+    rev_avg = (rh + ra) / 2
+
+    direct = direct_avg if direct_min >= 45 else direct_avg * 0.55
+    reversed_score = rev_avg if rev_min >= 45 else rev_avg * 0.55
+
+    if reversed_score > direct:
+        return reversed_score, "reversed", rh, ra, rev_min, rev_avg
+    return direct, "direct", dh, da, direct_min, direct_avg
 
 
 def get_live(home, away):
     """
     Link an Odds API game to an API-Football live fixture.
-    This replaces weak first-token matching with robust fuzzy matching.
+
+    Improvements:
+    - Normalizes names deeply.
+    - Uses token-set style scoring.
+    - Requires both teams to match, not only one team.
+    - Rejects weak random links.
     """
     if not live_data:
         return 0, "0-0", 0, 0, "", False
 
-    # Fast exact key match first
     exact_key = f"{home}_{away}"
     if exact_key in live_data:
         d = live_data[exact_key]
@@ -632,20 +683,11 @@ def get_live(home, away):
     for _, v in live_data.items():
         live_home = v.get("home_team", "")
         live_away = v.get("away_team", "")
+        score, mode, s1, s2, min_team, avg_team = match_pair_score(home, away, live_home, live_away)
 
-        home_score = similarity(home, live_home)
-        away_score = similarity(away, live_away)
-        direct_score = (home_score + away_score) / 2
-
-        # Some providers can swap home/away names in neutral venues or markets
-        rev_home_score = similarity(home, live_away)
-        rev_away_score = similarity(away, live_home)
-        reversed_score = (rev_home_score + rev_away_score) / 2
-
-        score = max(direct_score, reversed_score)
         detail = (
             f"candidate={live_home} vs {live_away} "
-            f"direct={direct_score:.1f} reversed={reversed_score:.1f}"
+            f"mode={mode} team_scores={s1}/{s2} min={min_team:.1f} avg={avg_team:.1f}"
         )
 
         if score > best_score:
@@ -653,12 +695,10 @@ def get_live(home, away):
             best = v
             best_detail = detail
 
-    # Require both teams to match reasonably well via combined score.
-    # 65 is permissive enough for provider naming differences but avoids random one-team matches.
-    if best and best_score >= 65:
+    if best and best_score >= 72:
         log.info(
             f"🔗 MATCH LINKED odds='{home} vs {away}' -> "
-            f"api='{best['home_team']} vs {best['away_team']}' score={best_score:.1f}"
+            f"api='{best['home_team']} vs {best['away_team']}' score={best_score:.1f} {best_detail}"
         )
         return best["minute"], best["score"], best["hg"], best["ag"], best["league"], True
 
