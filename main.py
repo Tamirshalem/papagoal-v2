@@ -379,7 +379,7 @@ def fetch_odds_api():
                     elif isinstance(d2, dict): result.extend(d2.get("data") or d2.get("results") or [])
             except Exception as e: log.error(f"OddsAPI batch: {e}")
         return result
-    except Exception as e: log.error(f"OddsAPI: {e}"); return []
+   log.info(f"OddsAPI odds: {r2.status_code} | {str(r2.text)[:300]}") except Exception as e: log.error(f"OddsAPI: {e}"); return []
 
 def parse_odds(items):
     parsed=[]
