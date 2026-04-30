@@ -9,7 +9,10 @@ import unicodedata
 from difflib import SequenceMatcher
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-ODDS_API_KEY      = os.environ.get("ODDS_API_KEY", "")
+ODDS_API_KEY      = os.environ.get("ODDS_API_KEY", "")  # legacy The Odds API
+ODDSPAPI_KEY       = os.environ.get("ODDSPAPI_KEY", "")
+USE_ODDSPAPI       = os.environ.get("USE_ODDSPAPI", "true").lower() == "true"
+ODDSPAPI_BOOKMAKER = os.environ.get("ODDSPAPI_BOOKMAKER", "Bet365")
 FOOTBALL_API_KEY  = os.environ.get("FOOTBALL_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
@@ -144,11 +147,6 @@ def init_db():
             odds_120s JSONB DEFAULT '{}',
             odds_300s JSONB DEFAULT '{}'
         )""")
-        # --- Goal odds capture diagnostics ---
-        conn.run("ALTER TABLE goals ADD COLUMN IF NOT EXISTS odds_captured BOOLEAN DEFAULT FALSE")
-        conn.run("ALTER TABLE goals ADD COLUMN IF NOT EXISTS snapshots_before_goal INT DEFAULT 0")
-        conn.run("ALTER TABLE goals ADD COLUMN IF NOT EXISTS missing_reason TEXT")
-
         conn.run("""CREATE TABLE IF NOT EXISTS signals (
             id SERIAL PRIMARY KEY, match_id TEXT,
             detected_at TIMESTAMPTZ DEFAULT NOW(),
@@ -769,292 +767,310 @@ def get_odds_before(conn, match_id, seconds):
             ORDER BY captured_at DESC LIMIT 20""",
             a=match_id, b=max(0, seconds-10), c=seconds+25)
         return {f"{r[0]}_{r[1]}": r[2] for r in rows} if rows else {}
-    except Exception as e:
-        log.warning(f"get_odds_before failed match={match_id} seconds={seconds}: {e}")
-        return {}
+# ─── OddsAPI.io Collector ─────────────────────────────────────────────────────
+# Pull ALL live football events from OddsAPI.io, then fetch Bet365 odds for every
+# event in batches of 10 every POLL_INTERVAL seconds.
+# Railway variable needed: ODDSPAPI_KEY=...
 
-def count_snapshots_before_goal(conn, match_id, seconds=300):
-    """How many odds snapshots exist before a goal window. Used to diagnose missing goal odds."""
+last_oddsapi_events = []
+last_oddsapi_raw_count = 0
+
+
+def chunked(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def first_present(d, keys, default=None):
+    if not isinstance(d, dict):
+        return default
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return default
+
+
+def as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        for k in ["data", "events", "odds", "results", "items"]:
+            if isinstance(value.get(k), list):
+                return value[k]
+        return list(value.values())
+    return []
+
+
+def extract_event_id(event):
+    return str(first_present(event, ["id", "eventId", "event_id", "eventID", "fixtureId", "fixture_id"], ""))
+
+
+def extract_teams(event):
+    home = first_present(event, ["home", "homeTeam", "home_team", "homeName", "home_name"])
+    away = first_present(event, ["away", "awayTeam", "away_team", "awayName", "away_name"])
+    if not home or not away:
+        teams_list = as_list(first_present(event, ["teams", "participants", "competitors"], []))
+        if len(teams_list) >= 2:
+            def tname(t):
+                if isinstance(t, dict):
+                    return first_present(t, ["name", "team", "title", "shortName", "displayName"], "")
+                return str(t)
+            for t in teams_list:
+                if isinstance(t, dict):
+                    side = str(first_present(t, ["side", "homeAway", "type", "qualifier"], "")).lower()
+                    if side == "home": home = tname(t)
+                    elif side == "away": away = tname(t)
+            home = home or tname(teams_list[0])
+            away = away or tname(teams_list[1])
+    name = first_present(event, ["name", "eventName", "event_name", "match", "title"], "")
+    if (not home or not away) and isinstance(name, str):
+        for sep in [" vs ", " v ", " - ", " @ "]:
+            if sep in name:
+                a, b = name.split(sep, 1)
+                home = home or a.strip()
+                away = away or b.strip()
+                break
+    return (home or "").strip(), (away or "").strip()
+
+
+def fetch_oddspapi_events():
+    if not ODDSPAPI_KEY:
+        log.warning("OddsAPI.io: missing ODDSPAPI_KEY")
+        return []
     try:
-        rows = conn.run("""SELECT COUNT(*) FROM odds_snapshots
-            WHERE match_id=:a
-            AND captured_at >= NOW()-INTERVAL '1 second'*:b""",
-            a=match_id, b=seconds)
-        return int(rows[0][0] or 0) if rows else 0
+        r = requests.get("https://api.odds-api.io/v3/events", params={"apiKey": ODDSPAPI_KEY, "sport": "football", "status": "live"}, timeout=20)
+        if r.status_code != 200:
+            log.warning(f"OddsAPI.io events: {r.status_code} {r.text[:250]}")
+            return []
+        events = as_list(r.json())
+        log.info(f"🎯 OddsAPI.io live events: {len(events)}")
+        return events
     except Exception as e:
-        log.warning(f"count_snapshots_before_goal failed match={match_id}: {e}")
-        return 0
+        log.error(f"OddsAPI.io events error: {e}")
+        return []
 
-# ─── Collector ────────────────────────────────────────────────────────────────
+
+def fetch_oddspapi_odds_multi(event_ids):
+    if not ODDSPAPI_KEY or not event_ids:
+        return []
+    all_items = []
+    base = "https://api.odds-api.io/v3"
+    bookmaker = ODDSPAPI_BOOKMAKER or "Bet365"
+    for batch in chunked(event_ids, 10):
+        ids_csv = ",".join(batch)
+        attempts = [
+            (f"{base}/odds/multi", {"apiKey": ODDSPAPI_KEY, "eventIds": ids_csv, "bookmakers": bookmaker}),
+            (f"{base}/odds/multi", {"apiKey": ODDSPAPI_KEY, "eventId": ids_csv, "bookmakers": bookmaker}),
+            (f"{base}/odds/multi", {"apiKey": ODDSPAPI_KEY, "ids": ids_csv, "bookmakers": bookmaker}),
+        ]
+        ok = False
+        for url, params in attempts:
+            try:
+                r = requests.get(url, params=params, timeout=25)
+                if r.status_code == 200:
+                    all_items.extend(as_list(r.json()))
+                    ok = True
+                    break
+                log.warning(f"OddsAPI.io multi try failed: {r.status_code} {r.text[:180]}")
+            except Exception as e:
+                log.warning(f"OddsAPI.io multi request error: {e}")
+        if ok:
+            continue
+        for eid in batch:
+            try:
+                r = requests.get(f"{base}/odds", params={"apiKey": ODDSPAPI_KEY, "eventId": eid, "bookmakers": bookmaker}, timeout=20)
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, dict) and not extract_event_id(data):
+                        data["eventId"] = eid
+                    all_items.extend(as_list(data) if isinstance(data, list) else [data])
+                else:
+                    log.warning(f"OddsAPI.io odds event={eid}: {r.status_code} {r.text[:180]}")
+            except Exception as e:
+                log.warning(f"OddsAPI.io odds event={eid} error: {e}")
+    log.info(f"📈 OddsAPI.io odds items: {len(all_items)} for events={len(event_ids)}")
+    return all_items
+
+
+def iter_bookmakers(odds_obj):
+    bks = first_present(odds_obj, ["bookmakers", "sportsbooks", "sites", "providers"], [])
+    if isinstance(bks, dict):
+        out=[]
+        for name, v in bks.items():
+            vv = dict(v) if isinstance(v, dict) else {"markets": v}
+            vv.setdefault("name", name)
+            out.append(vv)
+        return out
+    return as_list(bks)
+
+
+def is_bet365_bookmaker(bk):
+    name = str(first_present(bk, ["name", "title", "key", "bookmaker", "id"], "")).lower()
+    return "365" in name or not name
+
+
+def iter_markets(obj):
+    markets = first_present(obj, ["markets", "odds", "lines"], [])
+    if isinstance(markets, dict):
+        out=[]
+        for name, v in markets.items():
+            vv = dict(v) if isinstance(v, dict) else {"outcomes": v}
+            vv.setdefault("key", name)
+            out.append(vv)
+        return out
+    return as_list(markets)
+
+
+def normalize_market_key(raw):
+    s = str(raw or "").lower().replace(" ", "_").replace("-", "_")
+    if any(x in s for x in ["h2h", "moneyline", "match_winner", "winner", "1x2", "full_time_result"]): return "h2h"
+    if any(x in s for x in ["total", "over_under", "goals", "overunder"]): return "totals"
+    if "next_goal" in s: return "next_goal"
+    return s or "unknown"
+
+
+def parse_outcomes(market):
+    outcomes = first_present(market, ["outcomes", "runners", "selections", "prices"], [])
+    if isinstance(outcomes, dict):
+        out=[]
+        for name, v in outcomes.items():
+            vv = dict(v) if isinstance(v, dict) else {"price": v}
+            vv.setdefault("name", name)
+            out.append(vv)
+        return out
+    return as_list(outcomes)
+
+
+def outcome_name_and_price(outcome):
+    if not isinstance(outcome, dict): return "", None
+    name = first_present(outcome, ["name", "label", "selection", "runnerName", "outcome", "type"], "")
+    price = first_present(outcome, ["price", "odds", "decimal", "value", "back", "bestBackPrice"], None)
+    if isinstance(price, dict): price = first_present(price, ["price", "decimal", "value"], None)
+    try: price = float(price)
+    except Exception: price = None
+    return str(name), price
+
+
+def build_game_from_oddspapi(event, odds_obj=None):
+    eid = extract_event_id(event) or extract_event_id(odds_obj or {})
+    home, away = extract_teams(event)
+    if (not home or not away) and odds_obj: home, away = extract_teams(odds_obj)
+    league = first_present(event, ["league", "competition", "tournament"], "")
+    if isinstance(league, dict): league = first_present(league, ["name", "title"], "")
+    raw = odds_obj if odds_obj else event
+    raw_bks = iter_bookmakers(raw) or [{"name": ODDSPAPI_BOOKMAKER, "markets": iter_markets(raw)}]
+    bookmakers=[]
+    for bk in raw_bks:
+        if not is_bet365_bookmaker(bk): continue
+        markets=[]
+        for m in iter_markets(bk):
+            mkey = normalize_market_key(first_present(m, ["key", "name", "market", "type", "id"], ""))
+            outs=[]
+            for out in parse_outcomes(m):
+                name, price = outcome_name_and_price(out)
+                if price is None: continue
+                lname=name.lower()
+                if "over" in lname: name="Over"
+                elif "under" in lname: name="Under"
+                elif lname in ["x", "draw", "tie"]: name="Draw"
+                outs.append({"name": name, "price": price})
+            if outs: markets.append({"key": mkey, "outcomes": outs})
+        if markets: bookmakers.append({"key": ODDSPAPI_BOOKMAKER, "markets": markets})
+    return {"id": eid, "home_team": home, "away_team": away, "league": league, "bookmakers": bookmakers}
+
+
+def fetch_oddspapi_games():
+    events = fetch_oddspapi_events()
+    event_ids = [extract_event_id(e) for e in events if extract_event_id(e)]
+    odds_items = fetch_oddspapi_odds_multi(event_ids)
+    odds_by_event={}
+    for o in odds_items:
+        oid=extract_event_id(o)
+        if oid: odds_by_event[str(oid)] = o
+    games=[]
+    for e in events:
+        eid=extract_event_id(e)
+        game=build_game_from_oddspapi(e, odds_by_event.get(str(eid)))
+        if game["id"] and game["home_team"] and game["away_team"]: games.append(game)
+    return games
+
+
 def collect():
     try:
-        r = requests.get("https://api.the-odds-api.com/v4/sports/soccer/odds/",
-                        params={"apiKey": ODDS_API_KEY, "regions": "eu",
-                                "markets": "h2h,totals",
-                                "oddsFormat": "decimal", "dateFormat": "iso"},
-                        timeout=15)
-        if r.status_code != 200:
-            log.warning(f"Odds API: {r.status_code}")
+        games = fetch_oddspapi_games()
+        if not games:
+            global last_pipeline_stats
+            last_pipeline_stats = {"live_fixtures": len(live_data), "odds_games": 0, "linked_live": 0, "untracked_live": len(live_data), "last_odds_update": datetime.now(timezone.utc).isoformat(), "linked_examples": [], "unlinked_examples": [], "provider": "OddsAPI.io"}
+            log.warning("OddsAPI.io: no games/odds returned")
             return
-
-        games = r.json()
-        live_cnt = 0
-        linked_examples = []
-        unlinked_examples = []
-        conn = get_db()
+        live_cnt=0; linked_examples=[]; unlinked_examples=[]
+        conn=get_db()
         try:
             for game in games:
-                mid  = game["id"]
-                home = game["home_team"]
-                away = game["away_team"]
+                mid=str(game.get("id")); home=game.get("home_team",""); away=game.get("away_team","")
                 min_, score, hg, ag, league, is_live = get_live(home, away)
+                league = league or game.get("league","") or "OddsAPI.io"
                 if is_live:
                     live_cnt += 1
-                    if len(linked_examples) < 5:
-                        linked_examples.append(f"{home} vs {away}")
+                    if len(linked_examples) < 8: linked_examples.append(f"{home} vs {away}")
                 else:
-                    if len(unlinked_examples) < 8:
-                        unlinked_examples.append(f"{home} vs {away}")
-
-                # Get HT odds from Betfair
-                ht = get_ht_odds(home, away)
-                over05ht = ht.get("over05ht")
-                over15ht = ht.get("over15ht")
-
-                # Store opening odds
-                if is_live:
-                    if over05ht: set_opening(mid, "over05ht", over05ht)
-                    if over15ht: set_opening(mid, "over15ht", over15ht)
-
-                opening_o05 = get_opening(mid, "over05ht")
-                opening_o15 = get_opening(mid, "over15ht")
-
-                # Upsert match
+                    if len(unlinked_examples) < 12: unlinked_examples.append(f"{home} vs {away}")
+                over05ht=over15ht=None; opening_o05=get_opening(mid,"over05ht"); opening_o15=get_opening(mid,"over15ht")
                 try:
-                    conn.run("""INSERT INTO matches
-                        (match_id,league,home_team,away_team,minute,score_home,score_away,status,last_updated)
-                        VALUES (:a,:b,:c,:d,:e,:f,:g,:h,NOW())
-                        ON CONFLICT (match_id) DO UPDATE SET
-                        league=:b,minute=:e,score_home=:f,score_away=:g,status=:h,last_updated=NOW()""",
-                        a=mid, b=league, c=home, d=away, e=min_,
-                        f=hg, g=ag, h='live' if is_live else 'upcoming')
-                except: pass
-
-                over_odd = draw_odd = hw_odd = aw_odd = None
-                prev_over = None
-
+                    conn.run("""INSERT INTO matches (match_id,league,home_team,away_team,minute,score_home,score_away,status,last_updated) VALUES (:a,:b,:c,:d,:e,:f,:g,:h,NOW()) ON CONFLICT (match_id) DO UPDATE SET league=:b,minute=:e,score_home=:f,score_away=:g,status=:h,last_updated=NOW()""", a=mid,b=league,c=home,d=away,e=min_,f=hg,g=ag,h='live' if is_live else 'odds_only')
+                except Exception as e: log.warning(f"match upsert failed {home} vs {away}: {e}")
+                over_odd=draw_odd=hw_odd=aw_odd=None; prev_over=None
                 for bk in game.get("bookmakers", [])[:1]:
                     for mkt in bk.get("markets", []):
-                        mkey = mkt["key"]
+                        mkey=mkt.get("key","unknown")
                         for out in mkt.get("outcomes", []):
-                            oname = out["name"]
-                            price = float(out["price"])
-                            key   = f"{mid}_{mkey}_{oname}"
-                            now   = time.time()
-                            prev  = None
-                            held  = 0
-                            direction = "stable"
-                            change    = 0.0
-
+                            oname=out.get("name","")
+                            try: price=float(out.get("price"))
+                            except Exception: continue
+                            key=f"{mid}_{mkey}_{oname}"; now=time.time(); prev=None; held=0; direction="stable"; change=0.0
                             if key in last_prices:
-                                lp = last_prices[key]
-                                prev   = lp["price"]
-                                change = round(price - prev, 3)
-                                if abs(change) < 0.01:
-                                    held = int(now - lp["since"])
+                                lp=last_prices[key]; prev=lp["price"]; change=round(price-prev,3)
+                                if abs(change)<0.01: held=int(now-lp["since"])
                                 else:
-                                    last_prices[key] = {"price": price, "since": now}
-                                    direction = "down" if change < 0 else "up"
-                            else:
-                                last_prices[key] = {"price": price, "since": now}
-                            held = int(now - last_prices[key]["since"])
-
-                            if mkey == "totals" and oname == "Over":
-                                over_odd  = price
-                                pk = f"{mid}_over_prev"
-                                prev_over = last_prices.get(pk, {}).get("price")
-                                last_prices[pk] = {"price": price, "since": now}
-                                # Store opening
-                                set_opening(mid, "over25", price)
-                                opening_over25 = get_opening(mid, "over25")
-                                expected = get_expected(EXPECTED_OVER25, min_)
-                                pres = pressure_score(price, opening_over25, min_)
-                            if mkey == "h2h":
-                                if oname == "Draw":  draw_odd = price
-                                elif oname == home:  hw_odd   = price
-                                else:                aw_odd   = price
-
-                            opening_val = get_opening(mid, f"{mkey}_{oname}")
+                                    last_prices[key]={"price":price,"since":now}; direction="down" if change<0 else "up"
+                            else: last_prices[key]={"price":price,"since":now}
+                            held=int(now-last_prices[key]["since"])
+                            if mkey=="totals" and oname=="Over":
+                                over_odd=price; pk=f"{mid}_over_prev"; prev_over=last_prices.get(pk,{}).get("price"); last_prices[pk]={"price":price,"since":now}; set_opening(mid,"over25",price)
+                            if mkey=="h2h":
+                                if oname=="Draw": draw_odd=price
+                                elif normalize_team_name(oname)==normalize_team_name(home) or "home" in oname.lower(): hw_odd=price
+                                elif normalize_team_name(oname)==normalize_team_name(away) or "away" in oname.lower(): aw_odd=price
+                            opening_val=get_opening(mid, f"{mkey}_{oname}")
                             if not opening_val:
-                                set_opening(mid, f"{mkey}_{oname}", price)
-                                opening_val = price
-
-                            exp_val = None
-                            if mkey == "totals" and oname == "Over":
-                                exp_val = get_expected(EXPECTED_OVER25, min_)
-
-                            conn.run("""INSERT INTO odds_snapshots
-                                (match_id,minute,score_home,score_away,market,outcome,
-                                 odd_value,prev_odd,opening_odd,odd_change,direction,
-                                 held_seconds,pressure,expected_odd,is_live,source)
-                                VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,:l,:m,:n,:o,'odds_api')""",
-                                a=mid, b=min_, c=hg, d=ag, e=mkey, f=oname,
-                                g=price, h=prev, i=opening_val, j=change,
-                                k=direction, l=held,
-                                m=pressure_score(price, opening_val, min_),
-                                n=exp_val, o=is_live)
-
-                # Save Betfair HT odds
-                if over05ht and is_live:
-                    conn.run("""INSERT INTO odds_snapshots
-                        (match_id,minute,score_home,score_away,market,outcome,
-                         odd_value,prev_odd,opening_odd,is_live,source)
-                        VALUES (:a,:b,:c,:d,'over05ht','Over',:e,:f,:g,:h,'betfair')""",
-                        a=mid, b=min_, c=hg, d=ag,
-                        e=over05ht, f=over05ht, g=opening_o05 or over05ht, h=is_live)
-
-                if over15ht and is_live:
-                    conn.run("""INSERT INTO odds_snapshots
-                        (match_id,minute,score_home,score_away,market,outcome,
-                         odd_value,prev_odd,opening_odd,is_live,source)
-                        VALUES (:a,:b,:c,:d,'over15ht','Over',:e,:f,:g,:h,'betfair')""",
-                        a=mid, b=min_, c=hg, d=ag,
-                        e=over15ht, f=over15ht, g=opening_o15 or over15ht, h=is_live)
-
-                # Goal detection
-                prev_total = last_scores.get(mid)
-                curr_total = hg + ag
+                                set_opening(mid, f"{mkey}_{oname}", price); opening_val=price
+                            exp_val=get_expected(EXPECTED_OVER25, min_) if mkey=="totals" and oname=="Over" else None
+                            conn.run("""INSERT INTO odds_snapshots (match_id,minute,score_home,score_away,market,outcome,odd_value,prev_odd,opening_odd,odd_change,direction,held_seconds,pressure,expected_odd,is_live,source) VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,:l,:m,:n,:o,'oddspapi')""", a=mid,b=min_,c=hg,d=ag,e=mkey,f=oname,g=price,h=prev,i=opening_val,j=change,k=direction,l=held,m=pressure_score(price,opening_val,min_),n=exp_val,o=is_live)
+                prev_total=last_scores.get(mid); curr_total=hg+ag
                 if prev_total is not None and curr_total > prev_total and is_live:
                     log.info(f"⚽ GOAL: {home} vs {away} {score} min:{min_}")
-                    o10  = get_odds_before(conn, mid, 10)
-                    o30  = get_odds_before(conn, mid, 30)
-                    o60  = get_odds_before(conn, mid, 60)
-                    o120 = get_odds_before(conn, mid, 120)
-                    o300 = get_odds_before(conn, mid, 300)
-                    snapshots_before_goal = count_snapshots_before_goal(conn, mid, 300)
-                    odds_captured = any([bool(o10), bool(o30), bool(o60), bool(o120), bool(o300)])
-                    if odds_captured:
-                        missing_reason = None
-                    elif snapshots_before_goal <= 0:
-                        missing_reason = "no snapshots before goal / match had no linked odds"
-                    else:
-                        missing_reason = "snapshots existed but no odds found in requested time windows"
-                    log.info(
-                        f"Goal odds captured match={mid}: captured={odds_captured} "
-                        f"snaps={snapshots_before_goal} 10s={len(o10)} 30s={len(o30)} 60s={len(o60)} 120s={len(o120)} 300s={len(o300)}"
-                    )
-                    conn.run("""INSERT INTO goals
-                        (match_id,minute,score_before,score_after,auto_detected,
-                         odds_10s,odds_30s,odds_60s,odds_120s,odds_300s,
-                         odds_captured,snapshots_before_goal,missing_reason)
-                        VALUES (:a,:b,:c,:d,TRUE,:e,:f,:g,:h,:i,:j,:k,:l)""",
-                        a=mid, b=min_,
-                        c=str(prev_total), d=score,
-                        e=json.dumps(o10), f=json.dumps(o30),
-                        g=json.dumps(o60), h=json.dumps(o120),
-                        i=json.dumps(o300),
-                        j=odds_captured, k=snapshots_before_goal, l=missing_reason)
-                    for t, col in [(30,"goal_30s"),(60,"goal_60s"),(120,"goal_120s"),(300,"goal_300s")]:
-                        try:
-                            conn.run(f"UPDATE odds_snapshots SET {col}=TRUE WHERE match_id=:a AND captured_at>NOW()-INTERVAL '{t} seconds'", a=mid)
-                        except: pass
-
-                last_scores[mid] = curr_total
-
-                # Run rules
+                    o10=get_odds_before(conn,mid,10); o30=get_odds_before(conn,mid,30); o60=get_odds_before(conn,mid,60); o120=get_odds_before(conn,mid,120); o300=get_odds_before(conn,mid,300)
+                    conn.run("""INSERT INTO goals (match_id,minute,score_before,score_after,auto_detected,odds_10s,odds_30s,odds_60s,odds_120s,odds_300s) VALUES (:a,:b,:c,:d,TRUE,:e,:f,:g,:h,:i)""", a=mid,b=min_,c=str(prev_total),d=score,e=json.dumps(o10),f=json.dumps(o30),g=json.dumps(o60),h=json.dumps(o120),i=json.dumps(o300))
+                    log.info(f"Goal odds captured: 10s={len(o10)} 30s={len(o30)} 60s={len(o60)} 120s={len(o120)} 300s={len(o300)}")
+                    for t,col in [(30,"goal_30s"),(60,"goal_60s"),(120,"goal_120s"),(300,"goal_300s")]:
+                        try: conn.run(f"UPDATE odds_snapshots SET {col}=TRUE WHERE match_id=:a AND captured_at>NOW()-INTERVAL '{t} seconds'", a=mid)
+                        except Exception: pass
+                last_scores[mid]=curr_total
                 if over_odd and is_live:
-                    held_over = int(time.time() - last_prices.get(f"{mid}_totals_Over", {}).get("since", time.time()))
-                    dir_over  = "stable"
-                    chg_over  = 0.0
-                    if prev_over:
-                        chg_over = round(over_odd - prev_over, 3)
-                        dir_over = "down" if chg_over < 0 else ("up" if chg_over > 0 else "stable")
-
-                    pres = pressure_score(over_odd, get_opening(mid, "over25"), min_)
-
-                    sigs = run_rules(
-                        mid, home, away, league,
-                        over_odd, draw_odd, hw_odd, aw_odd,
-                        over05ht, over15ht, opening_o05, opening_o15,
-                        min_, held_over, dir_over, chg_over, pres
-                    )
-
+                    held_over=int(time.time()-last_prices.get(f"{mid}_totals_Over",{}).get("since",time.time())); dir_over="stable"; chg_over=0.0
+                    if prev_over: chg_over=round(over_odd-prev_over,3); dir_over="down" if chg_over<0 else ("up" if chg_over>0 else "stable")
+                    pres=pressure_score(over_odd, get_opening(mid,"over25"), min_)
+                    sigs=run_rules(mid,home,away,league,over_odd,draw_odd,hw_odd,aw_odd,over05ht,over15ht,opening_o05,opening_o15,min_,held_over,dir_over,chg_over,pres)
                     for s in sigs:
-                        conn.run("""INSERT INTO signals
-                            (match_id,home_team,away_team,league,rule_num,rule_name,
-                             minute,score,signal_type,verdict,confidence,reason,
-                             over_odd,draw_odd,over05ht_odd,over15ht_odd,
-                             opening_over05ht,opening_over15ht,
-                             pressure_score,held_seconds,direction,odd_change)
-                            VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,:l,
-                                    :m,:n,:o,:p,:q,:r,:s,:t,:u,:v)""",
-                            a=mid, b=home, c=away, d=league,
-                            e=s["rule_num"], f=s["rule_name"],
-                            g=min_, h=score, i=s["signal_type"],
-                            j=s["verdict"], k=s["confidence"], l=s["reason"],
-                            m=over_odd, n=draw_odd,
-                            o=over05ht, p=over15ht,
-                            q=opening_o05, r=opening_o15,
-                            s=pres, t=held_over, u=dir_over, v=chg_over)
-
-                    # AI for strong signals
-                    goal_sigs = [s for s in sigs if s["signal_type"] == "goal" and s["confidence"] >= 75]
-                    if goal_sigs and ANTHROPIC_API_KEY:
-                        try:
-                            sig_text = " | ".join([f"R{s['rule_num']} {s['rule_name']} ({s['confidence']}%)" for s in goal_sigs])
-                            ht_info = ""
-                            if over05ht:
-                                ht_info = f"\nOver 0.5 HT: {over05ht:.2f} (פתיחה: {opening_o05 or '?'})"
-                            if over15ht:
-                                ht_info += f"\nOver 1.5 HT: {over15ht:.2f} (פתיחה: {opening_o15 or '?'})"
-
-                            prompt = f"""אתה PapaGoal – מנתח שוק הימורים מקצועי.
-
-משחק: {home} vs {away} ({league})
-דקה: {min_} | תוצאה: {score}
-Over 2.5: {over_odd} | Draw: {draw_odd}
-כיוון: {dir_over} ({chg_over:+.3f}) | החזיק: {held_over}s{ht_info}
-לחץ שוק: {pres}%
-אותות: {sig_text}
-
-3 משפטים קצרים ומדויקים בעברית:
-1. מה השוק אומר עכשיו?
-2. האם כדאי להיכנס ובאיזה יחס?
-3. מה הסיכון?"""
-
-                            resp = requests.post(
-                                "https://api.anthropic.com/v1/messages",
-                                headers={"x-api-key": ANTHROPIC_API_KEY,
-                                        "anthropic-version": "2023-06-01",
-                                        "content-type": "application/json"},
-                                json={"model": "claude-sonnet-4-20250514",
-                                     "max_tokens": 200,
-                                     "messages": [{"role": "user", "content": prompt}]},
-                                timeout=15)
-                            if resp.status_code == 200:
-                                analysis = resp.json()["content"][0]["text"]
-                                conn.run("""INSERT INTO ai_insights (insight_type,content,goals_analyzed)
-                                    VALUES ('live_signal',:a,1)""",
-                                    a=f"{mid}|||{analysis}")
-                                log.info(f"🤖 AI: {home} vs {away}")
-                        except Exception as e:
-                            log.error(f"AI error: {e}")
-
+                        conn.run("""INSERT INTO signals (match_id,home_team,away_team,league,rule_num,rule_name,minute,score,signal_type,verdict,confidence,reason,over_odd,draw_odd,over05ht_odd,over15ht_odd,opening_over05ht,opening_over15ht,pressure_score,held_seconds,direction,odd_change) VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,:l,:m,:n,:o,:p,:q,:r,:s,:t,:u,:v)""", a=mid,b=home,c=away,d=league,e=s["rule_num"],f=s["rule_name"],g=min_,h=score,i=s["signal_type"],j=s["verdict"],k=s["confidence"],l=s["reason"],m=over_odd,n=draw_odd,o=over05ht,p=over15ht,q=opening_o05,r=opening_o15,s=pres,t=held_over,u=dir_over,v=chg_over)
             global last_pipeline_stats
-            last_pipeline_stats = {
-                "live_fixtures": len(live_data),
-                "odds_games": len(games),
-                "linked_live": live_cnt,
-                "untracked_live": max(0, len(live_data) - live_cnt),
-                "last_odds_update": datetime.now(timezone.utc).isoformat(),
-                "linked_examples": linked_examples,
-                "unlinked_examples": unlinked_examples,
-            }
-            log.info(f"✅ Saved | live:{live_cnt}/{len(games)} | fixtures:{len(live_data)} | untracked:{max(0, len(live_data)-live_cnt)}")
-        finally:
-            conn.close()
+            last_pipeline_stats={"live_fixtures":len(live_data),"odds_games":len(games),"linked_live":live_cnt,"untracked_live":max(0,len(live_data)-live_cnt),"last_odds_update":datetime.now(timezone.utc).isoformat(),"linked_examples":linked_examples,"unlinked_examples":unlinked_examples,"provider":"OddsAPI.io","bookmaker":ODDSPAPI_BOOKMAKER}
+            log.info(f"✅ OddsAPI.io Saved | linked:{live_cnt}/{len(games)} | fixtures:{len(live_data)} | untracked:{max(0,len(live_data)-live_cnt)} | bookmaker:{ODDSPAPI_BOOKMAKER}")
+        finally: conn.close()
     except Exception as e:
-        log.error(f"Collect error: {e}")
+        log.exception(f"Collect error: {e}")
 
 def collector_loop():
     time.sleep(5)
@@ -1509,12 +1525,10 @@ function showPage(p,btn){
 
 async function loadLive(){
   try{
-    const[st,si,ai,matches,health]=await Promise.all([
+    const[st,si,ai]=await Promise.all([
       fetch('/api/stats').then(r=>r.json()),
       fetch('/api/signals').then(r=>r.json()),
-      fetch('/api/ai_live').then(r=>r.json()),
-      fetch('/api/live_matches').then(r=>r.json()),
-      fetch('/api/odds_health').then(r=>r.json()).catch(()=>({}))
+      fetch('/api/ai_live').then(r=>r.json())
     ]);
     document.getElementById('sl-fixtures').textContent=st.live_fixtures||0;
     document.getElementById('sl-live').textContent=st.tracked_with_odds||st.live||0;
@@ -1536,33 +1550,32 @@ async function loadLive(){
         </div>
         ${linked?`<div style="margin-top:10px;font-size:11px;color:var(--green)">Linked: ${linked}</div>`:''}
         ${unlinked?`<div style="margin-top:6px;font-size:11px;color:var(--muted)">Odds not live/linked: ${unlinked}</div>`:''}
-        ${(st.live_fixtures||0)>0 && (st.tracked_with_odds||0)===0?`<div style="margin-top:10px;font-size:12px;color:var(--orange)">⚠️ יש משחקים חיים, אבל אין להם odds מחוברים כרגע.</div>`:''}
-        <div style="margin-top:10px;font-size:11px;color:var(--muted)">Snapshots 5m: ${health.snapshots_last_5m||0} · Goals with odds: ${health.goals_with_odds||0}/${health.goals_total||0}</div>`;
+        ${(st.live_fixtures||0)>0 && (st.tracked_with_odds||0)===0?`<div style="margin-top:10px;font-size:12px;color:var(--orange)">⚠️ יש משחקים חיים, אבל אין להם odds מחוברים כרגע.</div>`:''}`;
     }
     document.getElementById('upd-live').textContent='עדכון: '+new Date().toLocaleTimeString('he-IL');
     const aiMap={};
     ai.forEach(a=>aiMap[a.match_id]=a.analysis);
-    const signalMap={};
-    (si||[]).forEach(sig=>{
-      if(!signalMap[sig.match_id]) signalMap[sig.match_id]=[];
-      signalMap[sig.match_id].push(sig);
-    });
     const el=document.getElementById('live-cards');
-    if(!matches.length){
-      el.innerHTML='<div class="empty"><div class="empty-icon">📡</div><div>אין משחקים חיים כרגע</div></div>';
+    if(!si.length){
+      el.innerHTML='<div class="empty"><div class="empty-icon">✅</div><div style="font-size:15px;font-weight:700;margin-bottom:6px">אין אותות פעילים כרגע</div><div style="font-size:12px">עוקב אחרי '+(st.live_fixtures||0)+' משחקים חיים · '+(st.tracked_with_odds||st.live||0)+' עם odds</div></div>';
       return;
     }
-    el.innerHTML=matches.map(m=>{
-      const sigs=signalMap[m.match_id]||[];
-      const topSig=sigs[0]||null;
-      const pres=m.pressure||0;
-      const hasOdds=!!m.has_odds;
-      const cardClass=hasOdds?(pres>=60?'c-hot':'c-goal'):'c-warn';
+    const byMatch={};
+    si.forEach(s=>{
+      if(!byMatch[s.match_id]) byMatch[s.match_id]={...s,rules:[]};
+      if(!byMatch[s.match_id].rules.find(r=>r.rule_num===s.rule_num))
+        byMatch[s.match_id].rules.push(s);
+    });
+    el.innerHTML=Object.values(byMatch).map(m=>{
+      const c=m.signal_type||'warn';
+      const isHot=(m.pressure_score||0)>=60 || m.rule_num>=100;
+      const cardClass=isHot?'c-hot':mc[c]||'';
+      const rules=m.rules.map(r=>`R${r.rule_num} ${r.rule_name}`).join(' · ');
+      const pres=m.pressure_score||0;
       const presColor=pres>=70?'var(--green)':pres>=40?'var(--orange)':'var(--muted)';
-      const statusBadge=hasOdds?'<span class="badge b-live">WITH ODDS</span>':'<span class="badge b-min" style="color:var(--orange)">NO ODDS</span>';
-      const verdict=topSig?`${ic[topSig.signal_type]||'🟡'} ${topSig.verdict} · R${topSig.rule_num} ${topSig.rule_name}`:(hasOdds?'🧠 No active observation yet':'⚠️ Live detected, odds unavailable');
-      const reason=topSig?topSig.reason:(m.missing_reason||m.market_read||'');
-      const ai=aiMap[m.match_id]?`<div class="ai-box"><div class="ai-label">🤖 AI</div>${aiMap[m.match_id]}</div>`:'';
+      const ht05=m.over05ht_odd?`<div class="odd-tag ht-market"><div class="odd-label">0.5 HT</div><div class="odd-val">${m.over05ht_odd.toFixed(2)}</div></div>`:'';
+      const ht15=m.over15ht_odd?`<div class="odd-tag ht-market"><div class="odd-label">1.5 HT</div><div class="odd-val">${m.over15ht_odd.toFixed(2)}</div></div>`:'';
+      const ai=aiMap[m.match_id]?`<div class="ai-box"><div class="ai-label">🤖 CLAUDE AI</div>${aiMap[m.match_id]}</div>`:'';
       return `<div class="match-card ${cardClass}">
         <div class="match-top">
           <div>
@@ -1570,26 +1583,27 @@ async function loadLive(){
             <div class="match-league">${m.league||''}</div>
           </div>
           <div class="badges">
-            ${m.minute>0?`<span class="badge b-min">⏱ ${m.minute}'</span>`:''}
-            ${m.score?`<span class="badge b-score">${m.score}</span>`:''}
-            ${statusBadge}
+            ${m.minute>0?`<span class="badge b-min">⏱ ${m.minute}'`:''}
+            ${m.score&&m.score!='0-0'?`<span class="badge b-score">${m.score}</span>`:''}
+            ${isHot?'<span class="badge b-hot">🔥 HOT</span>':''}
+            <span class="badge b-live">LIVE</span>
             ${pres>0?`<span class="badge b-pressure">${pres}% לחץ</span>`:''}
           </div>
         </div>
         ${pres>0?`<div class="pressure-bar"><div class="pressure-fill" style="width:${pres}%;background:${presColor}"></div></div>`:''}
         <div class="odds-row">
-          ${m.over_odd?`<div class="odd-tag"><div class="odd-label">OVER</div><div class="odd-val">${Number(m.over_odd).toFixed(2)}</div></div>`:''}
-          ${m.draw_odd?`<div class="odd-tag"><div class="odd-label">DRAW</div><div class="odd-val">${Number(m.draw_odd).toFixed(2)}</div></div>`:''}
-          ${m.expected_odd?`<div class="odd-tag"><div class="odd-label">EXPECTED</div><div class="odd-val">${Number(m.expected_odd).toFixed(2)}</div></div>`:''}
-          ${m.opening_odd?`<div class="odd-tag"><div class="odd-label">OPEN</div><div class="odd-val">${Number(m.opening_odd).toFixed(2)}</div></div>`:''}
-          ${m.held_seconds?`<div class="odd-tag"><div class="odd-label">HELD</div><div class="odd-val">${m.held_seconds}s</div></div>`:''}
+          ${m.over_odd?`<div class="odd-tag"><div class="odd-label">OVER 2.5</div><div class="odd-val">${m.over_odd}</div></div>`:''}
+          ${m.draw_odd?`<div class="odd-tag"><div class="odd-label">DRAW</div><div class="odd-val">${m.draw_odd}</div></div>`:''}
+          ${ht05}${ht15}
+          ${m.held_seconds>0?`<div class="odd-tag"><div class="odd-label">HELD</div><div class="odd-val">${m.held_seconds}s</div></div>`:''}
         </div>
-        <div class="verdict ${hasOdds?'v-goal':'v-warn'}">${verdict}</div>
-        ${reason?`<div style="font-size:12px;color:var(--muted);line-height:1.5;margin-top:6px">${reason}</div>`:''}
-        ${!hasOdds?`<div style="font-size:11px;color:var(--orange);margin-top:8px">המשחק חי, אבל ספק היחסים לא החזיר odds מחוברים למשחק הזה.</div>`:''}
+        <div class="verdict ${vc[c]||'v-warn'}">${ic[c]||'🟡'} ${m.verdict} · ${rules}</div>
         ${ai}
       </div>`;
     }).join('');
+  }catch(e){console.error(e);}
+}
+
 async function loadGoals(){
   try{
     const goals=await fetch('/api/goals').then(r=>r.json());
@@ -1607,7 +1621,6 @@ async function loadGoals(){
           <div class="goal-min">⚽ דקה ${g.minute}</div>
         </div>
         <div style="font-size:12px;color:var(--muted);margin-bottom:4px">${g.score_before||'?'} → ${g.score_after||'?'} | ${g.league||''}</div>
-        ${g.odds_captured?`<div style="font-size:12px;color:var(--green);margin:8px 0">✅ Odds captured · snapshots before goal: ${g.snapshots_before_goal||0}</div>`:`<div style="font-size:12px;color:var(--orange);margin:8px 0">⚠️ No odds captured before this goal · snapshots: ${g.snapshots_before_goal||0}<br><span style="color:var(--muted)">${g.missing_reason||'match had no linked odds before goal'}</span></div>`}
         <div class="ot-grid">
           <div class="ot-cell"><div class="ot-label">10s</div><div class="ot-val">${getOdd(g.odds_10s,'over')}</div></div>
           <div class="ot-cell"><div class="ot-label">30s</div><div class="ot-val">${getOdd(g.odds_30s,'over')}</div></div>
@@ -1719,124 +1732,6 @@ setInterval(autoRefresh,20000);
 def index():
     return render_template_string(HTML)
 
-@app.route("/api/live_matches")
-def api_live_matches():
-    """Return every API-Football live fixture, including those without linked odds."""
-    try:
-        conn = get_db()
-        try:
-            rows = conn.run("""WITH latest AS (
-                SELECT DISTINCT ON (match_id, market, outcome)
-                    match_id, market, outcome, odd_value, opening_odd, expected_odd,
-                    pressure, held_seconds, direction, captured_at
-                FROM odds_snapshots
-                WHERE captured_at > NOW() - INTERVAL '10 minutes'
-                ORDER BY match_id, market, outcome, captured_at DESC
-            )
-            SELECT m.match_id,m.home_team,m.away_team,m.league,m.minute,m.score_home,m.score_away,
-                   l.market,l.outcome,l.odd_value,l.opening_odd,l.expected_odd,l.pressure,
-                   l.held_seconds,l.direction,l.captured_at
-            FROM matches m
-            JOIN latest l ON m.match_id=l.match_id
-            WHERE m.status='live' OR l.captured_at > NOW() - INTERVAL '10 minutes'
-            ORDER BY m.last_updated DESC""")
-
-            tracked = {}
-            for r in rows:
-                mid = r[0]
-                if mid not in tracked:
-                    tracked[mid] = {
-                        "match_id": mid,
-                        "home_team": r[1] or "",
-                        "away_team": r[2] or "",
-                        "league": r[3] or "",
-                        "minute": r[4] or 0,
-                        "score": f"{r[5] or 0}-{r[6] or 0}",
-                        "status": "WITH_ODDS",
-                        "has_odds": True,
-                        "odds": {},
-                        "pressure": 0,
-                        "last_odds_update": None,
-                        "market_read": "Tracked with odds",
-                    }
-                market_key = f"{r[7]}_{r[8]}"
-                tracked[mid]["odds"][market_key] = r[9]
-                if r[7] == "totals" and r[8] == "Over":
-                    tracked[mid]["over_odd"] = r[9]
-                    tracked[mid]["opening_odd"] = r[10]
-                    tracked[mid]["expected_odd"] = r[11]
-                    tracked[mid]["pressure"] = int(r[12] or 0)
-                    tracked[mid]["held_seconds"] = int(r[13] or 0)
-                    tracked[mid]["direction"] = r[14] or "stable"
-                if r[7] == "h2h" and (r[8] or "").lower() == "draw":
-                    tracked[mid]["draw_odd"] = r[9]
-                tracked[mid]["last_odds_update"] = str(r[15]) if r[15] else None
-
-            # Determine which API-Football fixtures are already represented in tracked odds.
-            tracked_norm_pairs = []
-            for m in tracked.values():
-                tracked_norm_pairs.append((normalize_team_name(m["home_team"]), normalize_team_name(m["away_team"])))
-
-            def is_already_tracked(home, away):
-                hn, an = normalize_team_name(home), normalize_team_name(away)
-                for th, ta in tracked_norm_pairs:
-                    if max(team_similarity(hn, th), team_similarity(hn, ta)) >= 85 and max(team_similarity(an, ta), team_similarity(an, th)) >= 85:
-                        return True
-                return False
-
-            all_matches = list(tracked.values())
-            for key, v in live_data.items():
-                if not is_already_tracked(v.get("home_team",""), v.get("away_team","")):
-                    all_matches.append({
-                        "match_id": key,
-                        "home_team": v.get("home_team",""),
-                        "away_team": v.get("away_team",""),
-                        "league": v.get("league",""),
-                        "minute": v.get("minute",0),
-                        "score": v.get("score","0-0"),
-                        "status": "NO_ODDS",
-                        "has_odds": False,
-                        "odds": {},
-                        "pressure": 0,
-                        "market_read": "Live match detected, odds unavailable",
-                        "missing_reason": "No linked odds from provider for this live fixture",
-                    })
-            all_matches.sort(key=lambda x: (not x.get("has_odds"), -(x.get("pressure") or 0), -(x.get("minute") or 0)))
-            return jsonify(all_matches)
-        finally:
-            conn.close()
-    except Exception as e:
-        log.error(f"api_live_matches error: {e}")
-        return jsonify([])
-
-@app.route("/api/odds_health")
-def api_odds_health():
-    try:
-        conn = get_db()
-        try:
-            snaps5 = conn.run("SELECT COUNT(*) FROM odds_snapshots WHERE captured_at > NOW()-INTERVAL '5 minutes'")[0][0]
-            live_snaps5 = conn.run("SELECT COUNT(DISTINCT match_id) FROM odds_snapshots WHERE captured_at > NOW()-INTERVAL '5 minutes' AND is_live=TRUE")[0][0]
-            goals_total = conn.run("SELECT COUNT(*) FROM goals")[0][0]
-            goals_with_odds = conn.run("SELECT COUNT(*) FROM goals WHERE COALESCE(odds_captured,FALSE)=TRUE")[0][0]
-            goals_without_odds = max(0, int(goals_total or 0) - int(goals_with_odds or 0))
-            return jsonify({
-                "live_fixtures": len(live_data),
-                "odds_games": last_pipeline_stats.get("odds_games", 0),
-                "linked_live": last_pipeline_stats.get("linked_live", 0),
-                "untracked_live": last_pipeline_stats.get("untracked_live", 0),
-                "snapshots_last_5m": snaps5,
-                "live_matches_with_snapshots_last_5m": live_snaps5,
-                "goals_total": goals_total,
-                "goals_with_odds": goals_with_odds,
-                "goals_without_odds": goals_without_odds,
-                "last_odds_update": last_pipeline_stats.get("last_odds_update"),
-            })
-        finally:
-            conn.close()
-    except Exception as e:
-        log.error(f"api_odds_health error: {e}")
-        return jsonify({"error": str(e)})
-
 @app.route("/api/stats")
 def api_stats():
     try:
@@ -1920,8 +1815,7 @@ def api_goals():
         try:
             rows = conn.run("""SELECT g.match_id,g.minute,g.score_before,g.score_after,
                 g.odds_10s,g.odds_30s,g.odds_60s,g.odds_120s,g.odds_300s,
-                g.recorded_at,m.home_team,m.away_team,m.league,
-                COALESCE(g.odds_captured,FALSE), COALESCE(g.snapshots_before_goal,0), g.missing_reason
+                g.recorded_at,m.home_team,m.away_team,m.league
                 FROM goals g LEFT JOIN matches m ON g.match_id=m.match_id
                 ORDER BY g.recorded_at DESC LIMIT 50""")
             result=[]
@@ -1930,15 +1824,10 @@ def api_goals():
                                "score_after":r[3],"odds_10s":r[4]or{},"odds_30s":r[5]or{},
                                "odds_60s":r[6]or{},"odds_120s":r[7]or{},"odds_300s":r[8]or{},
                                "recorded_at":str(r[9]),"home_team":r[10]or"",
-                               "away_team":r[11]or"","league":r[12]or"",
-                               "odds_captured": bool(r[13]),
-                               "snapshots_before_goal": int(r[14] or 0),
-                               "missing_reason": r[15] or ""})
+                               "away_team":r[11]or"","league":r[12]or""})
             return jsonify(result)
         finally: conn.close()
-    except Exception as e:
-        log.error(f"api_goals error: {e}")
-        return jsonify([])
+    except: return jsonify([])
 
 @app.route("/api/ai_live")
 def api_ai_live():
