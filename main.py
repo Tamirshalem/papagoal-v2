@@ -12,6 +12,8 @@ from difflib import SequenceMatcher
 ODDS_API_KEY      = os.environ.get("ODDS_API_KEY", "")
 FOOTBALL_API_KEY  = os.environ.get("FOOTBALL_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL      = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 DATABASE_URL      = os.environ.get("DATABASE_URL", "")
 BETFAIR_APP_KEY   = os.environ.get("BETFAIR_APP_KEY", "")
 BETFAIR_USERNAME  = os.environ.get("BETFAIR_USERNAME", "")
@@ -164,6 +166,27 @@ def init_db():
             insight_type TEXT, content TEXT,
             goals_analyzed INT DEFAULT 0
         )""")
+        conn.run("""CREATE TABLE IF NOT EXISTS ai_rule_candidates (
+            id SERIAL PRIMARY KEY,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            source TEXT DEFAULT 'openai',
+            rule_name TEXT,
+            description TEXT,
+            conditions_json JSONB DEFAULT '{}',
+            expected_outcome TEXT DEFAULT 'goal',
+            status TEXT DEFAULT 'candidate',
+            active BOOLEAN DEFAULT FALSE,
+            total_cases INT DEFAULT 0,
+            goals_2m INT DEFAULT 0,
+            goals_5m INT DEFAULT 0,
+            goals_10m INT DEFAULT 0,
+            success_rate_10m FLOAT DEFAULT 0,
+            confidence_level TEXT DEFAULT 'low',
+            promotion_reason TEXT,
+            UNIQUE(rule_name)
+        )""")
+        conn.run("CREATE INDEX IF NOT EXISTS idx_ai_rule_candidates_status ON ai_rule_candidates(status, active)")
         # --- Validation columns for learning engine ---
         conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS checked_2m BOOLEAN DEFAULT FALSE")
         conn.run("ALTER TABLE signals ADD COLUMN IF NOT EXISTS checked_5m BOOLEAN DEFAULT FALSE")
@@ -1134,6 +1157,95 @@ def update_pattern_stats(conn, row, goal2, goal5, goal10, false_positive, patter
     except Exception as e:
         log.error(f"update_pattern_stats error pattern={pattern_id}: {e}")
 
+
+def safe_json_loads(text, default=None):
+    if default is None:
+        default = {}
+    try:
+        return json.loads(text)
+    except Exception:
+        return default
+
+def extract_json_object(text):
+    """Extract first JSON object from model output."""
+    if not text:
+        return {}
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.replace("```json", "").replace("```", "").strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return safe_json_loads(text[start:end+1], {})
+    return safe_json_loads(text, {})
+
+def save_ai_rule_candidates(conn, ai_payload):
+    """Save AI suggested rules as inactive candidates. Does not activate them."""
+    saved = 0
+    rules = ai_payload.get("new_rules") or ai_payload.get("new_patterns_to_test") or []
+    if not isinstance(rules, list):
+        return 0
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        name = str(r.get("rule_name") or r.get("name") or r.get("pattern") or "").strip()
+        if not name:
+            continue
+        desc = str(r.get("description") or r.get("reason") or r.get("logic") or "").strip()
+        expected = str(r.get("expected_outcome") or r.get("outcome") or "goal").lower()
+        if expected not in ["goal", "no_goal", "trap"]:
+            expected = "goal"
+        conditions = r.get("conditions") or r.get("conditions_json") or {}
+        if isinstance(conditions, str):
+            conditions = {"text": conditions}
+        try:
+            conn.run("""INSERT INTO ai_rule_candidates
+                (rule_name, description, conditions_json, expected_outcome, status, active, updated_at)
+                VALUES (:n,:d,:c,:e,'candidate',FALSE,NOW())
+                ON CONFLICT (rule_name) DO UPDATE SET
+                    description=EXCLUDED.description,
+                    conditions_json=EXCLUDED.conditions_json,
+                    expected_outcome=EXCLUDED.expected_outcome,
+                    updated_at=NOW()""",
+                n=name, d=desc, c=json.dumps(conditions), e=expected)
+            saved += 1
+        except Exception as e:
+            log.error(f"save_ai_rule_candidates error {name}: {e}")
+    return saved
+
+def promote_ai_rule_candidates(conn):
+    """Promote inactive AI candidates only after enough validated evidence exists."""
+    try:
+        # Try to match by rule name if candidate name appears inside a PatternStats rule_name.
+        rows = conn.run("""SELECT c.id, c.rule_name,
+                   COALESCE(SUM(p.total_cases),0) AS cases,
+                   COALESCE(SUM(p.goals_10m),0) AS g10
+            FROM ai_rule_candidates c
+            LEFT JOIN pattern_stats p ON LOWER(p.rule_name) LIKE '%' || LOWER(c.rule_name) || '%'
+            WHERE c.active=FALSE AND c.status IN ('candidate','testing')
+            GROUP BY c.id, c.rule_name""")
+        promoted = 0
+        for cid, name, cases, g10 in rows:
+            cases = int(cases or 0)
+            g10 = int(g10 or 0)
+            rate = (g10 / cases * 100.0) if cases else 0.0
+            level = 'very_high' if cases >= 100 else ('high' if cases >= 30 else ('medium' if cases >= 10 else 'low'))
+            status = 'validated' if cases >= 10 and rate > 50 else ('testing' if cases > 0 else 'candidate')
+            active = bool(cases >= 10 and rate > 50)
+            reason = f"Auto-promoted: {cases} cases, success_rate_10m={rate:.1f}%" if active else None
+            conn.run("""UPDATE ai_rule_candidates SET
+                    total_cases=:cases, goals_10m=:g10, success_rate_10m=:rate,
+                    confidence_level=:level, status=:status, active=:active,
+                    promotion_reason=:reason, updated_at=NOW()
+                WHERE id=:id""",
+                cases=cases, g10=g10, rate=rate, level=level, status=status,
+                active=active, reason=reason, id=cid)
+            if active:
+                promoted += 1
+        if promoted:
+            log.info(f"AI rule candidates promoted: {promoted}")
+    except Exception as e:
+        log.error(f"promote_ai_rule_candidates error: {e}")
 def validate_signals():
     try:
         conn = get_db()
@@ -1191,6 +1303,7 @@ def validate_signals():
                     WHERE id=:id""",
                     g2=g2, g5=g5, g10=g10, fp=false_positive, fr=reason, pid=pattern_id, id=sid)
                 update_pattern_stats(conn, row, g2, g5, g10, false_positive, pattern_id)
+                promote_ai_rule_candidates(conn)
                 finalised += 1
                 log.info(f"VALIDATED signal {sid} | pattern={pattern_id} | goal10={g10} | fp={false_positive}")
         if staged or finalised:
@@ -1713,11 +1826,10 @@ def api_insights():
     except: return jsonify([])
 
 @app.route("/api/run_ai", methods=["POST"])
-@app.route("/api/run_ai", methods=["POST"])
 def api_run_ai():
-    """Run Claude AI analysis safely without crashing on empty data or API errors."""
-    if not ANTHROPIC_API_KEY:
-        msg = "חסר ANTHROPIC_API_KEY ב-Railway. הוסף את המפתח של Anthropic ב-Variables."
+    """Run OpenAI analysis, save insights, and store suggested rules as inactive candidates."""
+    if not OPENAI_API_KEY:
+        msg = "חסר OPENAI_API_KEY ב-Railway. הוסף אותו ב-Variables בשם OPENAI_API_KEY."
         try:
             conn = get_db()
             try:
@@ -1727,7 +1839,7 @@ def api_run_ai():
                 conn.close()
         except Exception:
             pass
-        return jsonify({"error": "Missing ANTHROPIC_API_KEY", "message": msg}), 400
+        return jsonify({"error": "Missing OPENAI_API_KEY", "message": msg}), 400
 
     try:
         conn = get_db()
@@ -1738,7 +1850,7 @@ def api_run_ai():
                 ORDER BY g.recorded_at DESC LIMIT 100""")
 
             signals = conn.run("""SELECT rule_num,rule_name,signal_type,confidence,pressure_score,minute,
-                over_odd,draw_odd,reason,detected_at
+                over_odd,draw_odd,reason,detected_at, validated, goal_10m, false_positive
                 FROM signals
                 ORDER BY detected_at DESC LIMIT 150""")
 
@@ -1748,7 +1860,7 @@ def api_run_ai():
             ht_snapshots = conn.run("SELECT COUNT(*) FROM odds_snapshots WHERE market IN ('over05ht','over15ht')")[0][0]
 
             validation_summary = "Validation data not available yet."
-            pattern_summary = "PatternStats table not available yet."
+            pattern_summary = "No pattern_stats rows yet."
 
             try:
                 v = conn.run("""SELECT
@@ -1771,11 +1883,9 @@ def api_run_ai():
                     FROM pattern_stats ORDER BY total_cases DESC LIMIT 20""")
                 if p:
                     pattern_summary = "\n".join([
-                        f"{row[0]} | cases={row[1]} | 5m={round((row[2] or 0)*100,1)}% | 10m={round((row[3] or 0)*100,1)}% | confidence={row[4]}"
+                        f"{row[0]} | cases={row[1]} | 5m={round((row[2] or 0),1)}% | 10m={round((row[3] or 0),1)}% | confidence={row[4]}"
                         for row in p
                     ])
-                else:
-                    pattern_summary = "No pattern_stats rows yet."
             except Exception as e:
                 log.warning(f"AI pattern summary unavailable: {e}")
 
@@ -1787,11 +1897,11 @@ def api_run_ai():
                     "2. snapshots לפני ואחרי שינויי יחס\n"
                     "3. goals מזוהים אוטומטית\n"
                     "4. signals שעוברים validation אחרי 2/5/10 דקות\n\n"
-                    "ברגע שיצטברו signals וגולים, Claude יוכל להתחיל לזהות דפוסים אמיתיים."
+                    "ברגע שיצטברו signals וגולים, OpenAI יוכל להתחיל לזהות דפוסים אמיתיים."
                 )
                 conn.run("""INSERT INTO ai_insights (insight_type,content,goals_analyzed)
                     VALUES ('market_analysis',:a,0)""", a=content)
-                return jsonify({"status":"ok","message":"Not enough data yet","analysis":content})
+                return jsonify({"status":"ok","message":"Not enough data yet","analysis":content,"rules_saved":0})
 
             goals_lines = []
             for g in goals[:30]:
@@ -1808,16 +1918,17 @@ def api_run_ai():
             signal_lines = []
             for s in signals[:40]:
                 signal_lines.append(
-                    f"R{s[0]} {s[1]} | type={s[2]} | conf={s[3]} | pressure={s[4]} | minute={s[5]} | over={s[6]} | draw={s[7]} | reason={s[8]}"
+                    f"R{s[0]} {s[1]} | type={s[2]} | conf={s[3]} | pressure={s[4]} | minute={s[5]} | over={s[6]} | draw={s[7]} | validated={s[10]} | goal10={s[11]} | fp={s[12]} | reason={s[8]}"
                 )
 
-            prompt = f"""אתה PapaGoal AI — מנתח שוק הימורים ולמידת דפוסים.
+            prompt = f"""אתה PapaGoal AI — מנתח שוק הימורי כדורגל ולמידת דפוסים.
 
-חשוב:
+חשוב מאוד:
 - המערכת במצב Learning Mode.
 - אל תיתן הוראות הימור ישירות.
 - אל תגיד ENTER / BET / EXIT.
-- תן ניתוח הסתברותי, מה חסר, ומה כדאי למערכת להמשיך ללמוד.
+- תן ניתוח הסתברותי בלבד.
+- אם אתה מציע חוקים חדשים, הם רק candidates לבדיקה, לא חוקים פעילים.
 
 מצב הדאטה:
 - snapshots: {total_snapshots}
@@ -1835,58 +1946,86 @@ PatternStats:
 Signals אחרונים:
 {chr(10).join(signal_lines) if signal_lines else 'No signals yet'}
 
-ענה בעברית בצורה מסודרת:
-1. מה ניתן ללמוד כרגע מהנתונים?
-2. האם יש מספיק דאטה או שהמערכת עדיין מוקדמת מדי?
-3. אילו דפוסים ראשוניים אפשר לחשוד בהם, אם בכלל?
-4. איפה קיימים סיכוני false positive?
-5. מה חסר כדי להגיע לתובנות אמינות?
-6. אילו 3 דברים הכי חשוב להמשיך לאסוף עכשיו?
+החזר JSON בלבד במבנה הבא:
+{{
+  "summary": "סיכום בעברית",
+  "strong_patterns": [{{"pattern":"...","reason":"...","confidence":0}}],
+  "weak_patterns": [{{"pattern":"...","reason":"..."}}],
+  "trap_patterns": [{{"pattern":"...","reason":"..."}}],
+  "recommended_adjustments": ["..."],
+  "new_rules": [
+    {{
+      "rule_name": "שם חוק קצר",
+      "description": "הסבר בעברית",
+      "expected_outcome": "goal",
+      "conditions": {{
+        "minute_range": "30-40",
+        "odds_range": "2.10-2.40",
+        "pressure_min": 50,
+        "movement": "steady_or_pressure"
+      }}
+    }}
+  ]
+}}
 """
 
-            model = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
             resp = requests.post(
-                "https://api.anthropic.com/v1/messages",
+                "https://api.openai.com/v1/chat/completions",
                 headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
                 },
                 json={
-                    "model": model,
-                    "max_tokens": 1400,
+                    "model": OPENAI_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 1500,
+                    "temperature": 0.2,
                 },
                 timeout=45,
             )
 
             if resp.status_code != 200:
                 error_text = resp.text[:1000]
-                log.error(f"Claude API error status={resp.status_code}: {error_text}")
+                log.error(f"OpenAI API error status={resp.status_code}: {error_text}")
                 content = (
-                    "Claude AI לא הצליח להריץ ניתוח כרגע.\n\n"
+                    "OpenAI לא הצליח להריץ ניתוח כרגע.\n\n"
                     f"Status: {resp.status_code}\n"
                     f"Details: {error_text}\n\n"
                     "המערכת ממשיכה לאסוף נתונים כרגיל."
                 )
-                try:
-                    conn.run("""INSERT INTO ai_insights (insight_type,content,goals_analyzed)
-                        VALUES ('market_analysis',:a,:b)""", a=content, b=total_goals)
-                except Exception:
-                    pass
-                return jsonify({
-                    "error": "Claude API failed",
-                    "status_code": resp.status_code,
-                    "details": error_text,
-                }), 500
+                conn.run("""INSERT INTO ai_insights (insight_type,content,goals_analyzed)
+                    VALUES ('market_analysis',:a,:b)""", a=content, b=total_goals)
+                return jsonify({"error":"OpenAI API failed","status_code":resp.status_code,"details":error_text,"analysis":content}), 500
 
             data = resp.json()
-            analysis = data.get("content", [{}])[0].get("text", "No text returned from Claude")
+            raw = data["choices"][0]["message"]["content"]
+            payload = extract_json_object(raw)
+            summary = payload.get("summary") if isinstance(payload, dict) else None
+            if not summary:
+                summary = raw
+
+            rules_saved = save_ai_rule_candidates(conn, payload if isinstance(payload, dict) else {})
+            promote_ai_rule_candidates(conn)
+
+            content = summary
+            if isinstance(payload, dict):
+                extras = []
+                for key, title in [
+                    ("strong_patterns", "דפוסים חזקים"),
+                    ("weak_patterns", "דפוסים חלשים"),
+                    ("trap_patterns", "מלכודות"),
+                    ("recommended_adjustments", "שיפורים מומלצים"),
+                ]:
+                    val = payload.get(key) or []
+                    if val:
+                        extras.append(f"\n{title}:\n{json.dumps(val, ensure_ascii=False, indent=2)}")
+                if extras:
+                    content += "\n" + "\n".join(extras)
 
             conn.run("""INSERT INTO ai_insights (insight_type,content,goals_analyzed)
-                VALUES ('market_analysis',:a,:b)""", a=analysis, b=total_goals)
+                VALUES ('market_analysis',:a,:b)""", a=content, b=total_goals)
 
-            return jsonify({"status":"ok","analysis":analysis,"goals_analyzed":total_goals})
+            return jsonify({"status":"ok","analysis":content,"rules_saved":rules_saved,"raw":payload})
 
         finally:
             conn.close()
@@ -1895,61 +2034,31 @@ Signals אחרונים:
         log.exception("run_ai failed")
         return jsonify({"error":"run_ai crashed","details":str(e)}), 500
 
-
-@app.route("/api/debug_linking")
-def api_debug_linking():
-    """Show why Odds API games are or are not linking to API-Football fixtures."""
+@app.route("/api/ai_rules")
+def api_ai_rules():
     try:
-        fetch_live_football()
-        r = requests.get(
-            "https://api.the-odds-api.com/v4/sports/soccer/odds/",
-            params={
-                "apiKey": ODDS_API_KEY,
-                "regions": "eu",
-                "markets": "h2h,totals",
-                "oddsFormat": "decimal",
-                "dateFormat": "iso"
-            },
-            timeout=15
-        )
-        odds_games = r.json() if r.status_code == 200 else []
-        rows = []
-
-        for game in odds_games[:30]:
-            home = game.get("home_team", "")
-            away = game.get("away_team", "")
-
-            best = None
-            best_score = 0
-            for _, v in live_data.items():
-                direct = (similarity(home, v.get("home_team", "")) + similarity(away, v.get("away_team", ""))) / 2
-                rev = (similarity(home, v.get("away_team", "")) + similarity(away, v.get("home_team", ""))) / 2
-                score = max(direct, rev)
-                if score > best_score:
-                    best_score = score
-                    best = v
-
-            rows.append({
-                "odds_home": home,
-                "odds_away": away,
-                "best_api_home": best.get("home_team") if best else None,
-                "best_api_away": best.get("away_team") if best else None,
-                "best_score": round(best_score, 1),
-                "linked": best_score >= 65,
-                "minute": best.get("minute") if best else None,
-                "score": best.get("score") if best else None,
-            })
-
-        return jsonify({
-            "live_fixtures": len(live_data),
-            "odds_games": len(odds_games),
-            "linked_count": sum(1 for x in rows if x["linked"]),
-            "rows": rows
-        })
+        conn = get_db()
+        try:
+            rows = conn.run("""SELECT id, created_at, updated_at, rule_name, description,
+                    conditions_json, expected_outcome, status, active, total_cases,
+                    goals_10m, success_rate_10m, confidence_level, promotion_reason
+                FROM ai_rule_candidates
+                ORDER BY active DESC, total_cases DESC, updated_at DESC
+                LIMIT 200""")
+            cols = ["id","created_at","updated_at","rule_name","description","conditions_json",
+                    "expected_outcome","status","active","total_cases","goals_10m",
+                    "success_rate_10m","confidence_level","promotion_reason"]
+            out = []
+            for r in rows:
+                d = dict(zip(cols, r))
+                d["created_at"] = str(d["created_at"])
+                d["updated_at"] = str(d["updated_at"])
+                out.append(d)
+            return jsonify(out)
+        finally:
+            conn.close()
     except Exception as e:
-        log.error(f"debug_linking error: {e}")
-        return jsonify({"error": str(e), "live_fixtures": len(live_data), "rows": []}), 500
-
+        return jsonify({"error": str(e), "rules": []}), 500
 
 @app.route("/api/validation_stats")
 def api_validation_stats():
