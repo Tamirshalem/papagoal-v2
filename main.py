@@ -1026,10 +1026,10 @@ def fetch_oddspapi_games():
 
 
 def collect():
+    global last_pipeline_stats
     try:
         games = fetch_oddspapi_games()
         if not games:
-            global last_pipeline_stats
             last_pipeline_stats = {"live_fixtures": len(live_data), "odds_games": 0, "linked_live": 0, "untracked_live": len(live_data), "last_odds_update": datetime.now(timezone.utc).isoformat(), "linked_examples": [], "unlinked_examples": [], "provider": "OddsAPI.io"}
             log.warning("OddsAPI.io: no games/odds returned")
             return
@@ -1111,7 +1111,6 @@ def collect():
                             create_simulated_bet(conn, sig_id, mid, home, away, league, min_, score, sig, over_odd)
                         except Exception as e:
                             log.warning(f"simulated bet create failed: {e}")
-            global last_pipeline_stats
             last_pipeline_stats={"live_fixtures":len(live_data),"odds_games":len(games),"linked_live":live_cnt,"untracked_live":max(0,len(live_data)-live_cnt),"last_odds_update":datetime.now(timezone.utc).isoformat(),"linked_examples":linked_examples,"unlinked_examples":unlinked_examples,"provider":"OddsAPI.io","bookmaker":ODDSPAPI_BOOKMAKER}
             log.info(f"✅ OddsAPI.io Saved | linked:{live_cnt}/{len(games)} | fixtures:{len(live_data)} | untracked:{max(0,len(live_data)-live_cnt)} | bookmaker:{ODDSPAPI_BOOKMAKER}")
         finally: conn.close()
