@@ -169,21 +169,33 @@ betfair_session = {"token": None, "expires": 0}
 
 def betfair_login():
     try:
-        resp = requests.post(
-            "https://identitysso.betfair.com/api/login",
-            data={"username": BETFAIR_USERNAME, "password": BETFAIR_PASSWORD},
-            headers={"X-Application": BETFAIR_APP_KEY, "Content-Type": "application/x-www-form-urlencoded"},
-            timeout=10
-        )
-        data = resp.json()
-        if data.get("status") == "SUCCESS":
-            betfair_session["token"] = data["token"]
-            betfair_session["expires"] = time.time() + 3600
-            log.info("✅ Betfair logged in")
-            return True
-        else:
-            log.warning(f"Betfair login failed: {data}")
-            return False
+        # Try primary endpoint first
+        for url in [
+            "https://identitysso-cert.betfair.com/api/login",
+            "https://identitysso.betfair.com/api/login"
+        ]:
+            try:
+                resp = requests.post(
+                    url,
+                    data={"username": BETFAIR_USERNAME, "password": BETFAIR_PASSWORD},
+                    headers={"X-Application": BETFAIR_APP_KEY,
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Accept": "application/json"},
+                    timeout=10
+                )
+                if resp.text:
+                    data = resp.json()
+                    if data.get("status") == "SUCCESS":
+                        betfair_session["token"] = data["token"]
+                        betfair_session["expires"] = time.time() + 3600
+                        log.info("✅ Betfair logged in")
+                        return True
+                    else:
+                        log.warning(f"Betfair login failed: {data}")
+            except Exception as e:
+                log.warning(f"Betfair endpoint {url} failed: {e}")
+                continue
+        return False
     except Exception as e:
         log.error(f"Betfair login error: {e}")
         return False
@@ -1277,7 +1289,9 @@ def api_run_ai():
                 analysis=resp.json()["content"][0]["text"]
                 conn.run("INSERT INTO ai_insights (insight_type,content,goals_analyzed) VALUES ('market_analysis',:a,:b)",
                     a=analysis,b=len(goals))
-                return jsonify({"status":"ok"})
+                return jsonify({"status":"ok","analysis":analysis})
+            else:
+                return jsonify({"error":f"Claude API: {resp.status_code}"}),500
         finally: conn.close()
     except Exception as e:
         return jsonify({"error":str(e)}),500
