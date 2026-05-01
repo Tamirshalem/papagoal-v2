@@ -158,7 +158,12 @@ def init_db():
                     conn.run("INSERT INTO rules (rule_name,description,action) VALUES (:a,:b,:c) ON CONFLICT DO NOTHING",
                         a=d[0],b=d[1],c=d[2])
                 except: pass
-        log.info("✅ DB ready")
+      try:
+    conn.run("ALTER TABLE goals ADD COLUMN IF NOT EXISTS goal_time TIMESTAMPTZ DEFAULT NOW()")
+except: pass
+try:
+    conn.run("ALTER TABLE goals ADD COLUMN IF NOT EXISTS had_snapshots BOOLEAN DEFAULT FALSE")
+except: pass
     except Exception as e:
         log.error(f"DB init: {e}")
     finally:
