@@ -395,11 +395,11 @@ def fetch_odds_api():
         for i in range(0, len(ids), 10):
             batch = ids[i:i+10]
             try:
-                r2 = requests.get("https://api.odds-api.io/v3/odds",
+                # Use /multi endpoint with eventIds parameter
+                r2 = requests.get("https://api.odds-api.io/v3/odds/multi",
                     params={"apiKey":ODDSAPI_KEY,
-                           "eventId":",".join(batch),
-                           "bookmakers":"Bet365",
-                           "markets":"1x2,over_under_25"},
+                           "eventIds":",".join(batch),
+                           "bookmakers":"Bet365"},
                     timeout=15)
                 if r2.status_code == 200:
                     raw2 = r2.json()
@@ -408,7 +408,7 @@ def fetch_odds_api():
                     elif isinstance(raw2, dict):
                         result.extend(raw2.get("data") or raw2.get("results") or [])
                 else:
-                    log.warning(f"OddsAPI odds batch: {r2.status_code}")
+                    log.warning(f"OddsAPI odds batch: {r2.status_code} | {r2.text[:100]}")
             except Exception as e:
                 log.error(f"OddsAPI batch error: {e}")
         return result
@@ -420,41 +420,65 @@ def parse_odds(items):
     parsed = []
     for item in (items if isinstance(items,list) else [items]):
         try:
-            home = (item.get("homeTeam") or item.get("home_team") or
-                   item.get("home") or
-                   (item.get("participants") or {}).get("home",""))
-            away = (item.get("awayTeam") or item.get("away_team") or
-                   item.get("away") or
-                   (item.get("participants") or {}).get("away",""))
+            home = (item.get("home") or item.get("homeTeam") or item.get("home_team") or "")
+            away = (item.get("away") or item.get("awayTeam") or item.get("away_team") or "")
             if not home or not away: continue
             event_id = str(item.get("id") or item.get("eventId") or item.get("event_id") or "")
-            league   = (item.get("league") or item.get("competition") or
-                       item.get("tournament") or item.get("sport_title") or "")
+            league   = (item.get("league") or item.get("competition") or item.get("sport_title") or "")
             over25 = draw = hw = aw = over05ht = over15ht = None
-            bookmakers = item.get("bookmakers") or item.get("odds") or []
-            if isinstance(bookmakers, dict): bookmakers = [bookmakers]
-            for bk in bookmakers:
-                markets = bk.get("markets") or bk.get("bets") or []
-                if isinstance(markets, dict): markets = list(markets.values())
-                for mkt in markets:
-                    mname = (mkt.get("name") or mkt.get("key") or mkt.get("type") or "").lower()
-                    outcomes = mkt.get("outcomes") or mkt.get("selections") or mkt.get("values") or []
-                    if isinstance(outcomes, dict):
-                        outcomes = [{"name":k,"price":v} for k,v in outcomes.items()]
-                    for out in outcomes:
-                        oname = str(out.get("name") or out.get("label") or "").lower()
-                        price = float(out.get("price") or out.get("odd") or out.get("value") or 0)
-                        if price <= 1: continue
-                        if any(x in mname for x in ["over_under_25","totals","over/under 2.5"]) and "2.5" in mname:
-                            if "over" in oname: over25 = price
-                        elif any(x in mname for x in ["1x2","match_winner","h2h","moneyline"]):
-                            if any(x in oname for x in ["draw","tie","x"]): draw = price
-                            elif oname in ["1","home","home win"]: hw = price
-                            elif oname in ["2","away","away win"]: aw = price
-                        elif "0.5" in mname and any(x in mname for x in ["ht","half"]):
-                            if "over" in oname: over05ht = price
-                        elif "1.5" in mname and any(x in mname for x in ["ht","half"]):
-                            if "over" in oname: over15ht = price
+
+            # OddsAPI.io format: bookmakers is a dict {BookmakerName: [markets]}
+            bookmakers = item.get("bookmakers") or {}
+            if isinstance(bookmakers, dict):
+                for bk_name, markets in bookmakers.items():
+                    if not isinstance(markets, list): continue
+                    for mkt in markets:
+                        mname = (mkt.get("name") or "").upper()
+                        odds_list = mkt.get("odds") or []
+                        if not odds_list: continue
+                        odds = odds_list[0]  # Take first odds entry
+
+                        if mname == "ML":
+                            hw   = float(odds.get("home") or 0) or None
+                            draw = float(odds.get("draw") or 0) or None
+                            aw   = float(odds.get("away") or 0) or None
+                        elif mname in ["OVER/UNDER", "TOTALS", "O/U"]:
+                            # Could have max field for line
+                            line = float(odds.get("max") or odds.get("line") or 2.5)
+                            if abs(line - 2.5) < 0.1:
+                                over25 = float(odds.get("over") or 0) or None
+                        elif "0.5" in mname and "HT" in mname:
+                            over05ht = float(odds.get("over") or 0) or None
+                        elif "1.5" in mname and "HT" in mname:
+                            over15ht = float(odds.get("over") or 0) or None
+
+            # Also handle array format just in case
+            elif isinstance(bookmakers, list):
+                for bk in bookmakers:
+                    markets = bk.get("markets") or bk.get("bets") or []
+                    for mkt in markets:
+                        mname = (mkt.get("name") or mkt.get("key") or "").lower()
+                        outcomes = mkt.get("outcomes") or mkt.get("odds") or []
+                        if isinstance(outcomes, dict):
+                            # Dict format like {"home": 2.1, "draw": 3.4, "away": 3.2}
+                            if any(x in mname for x in ["ml","1x2","match"]):
+                                hw   = float(outcomes.get("home") or 0) or None
+                                draw = float(outcomes.get("draw") or 0) or None
+                                aw   = float(outcomes.get("away") or 0) or None
+                            elif "over" in mname and "2.5" in mname:
+                                over25 = float(outcomes.get("over") or 0) or None
+                        elif isinstance(outcomes, list):
+                            for out in outcomes:
+                                oname = str(out.get("name") or out.get("label") or "").lower()
+                                price = float(out.get("price") or out.get("odd") or 0)
+                                if price <= 1: continue
+                                if any(x in mname for x in ["ml","1x2","match"]):
+                                    if "draw" in oname: draw = price
+                                    elif oname in ["1","home"]: hw = price
+                                    elif oname in ["2","away"]: aw = price
+                                elif "2.5" in mname and "over" in oname:
+                                    over25 = price
+
             if over25 or draw or hw:
                 parsed.append({"event_id":event_id,"home":home,"away":away,"league":league,
                                "over25":over25,"draw":draw,"hw":hw,"aw":aw,
