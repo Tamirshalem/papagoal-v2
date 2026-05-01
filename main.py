@@ -689,7 +689,7 @@ Signals: {sig_text}
 
             # Resolve old pending trades
             resolve_old_trades(conn)
-            log.info(f"✅ Saved | live:{live_cnt}/{len(parsed)}")
+            if parsed: log.info(f"Sample game: {parsed[0]}") log.info(f"✅ Saved | live:{live_cnt}/{len(parsed)}")
         finally:
             conn.close()
     except Exception as e:
